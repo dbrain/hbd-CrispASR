@@ -278,20 +278,6 @@ struct parakeet_tdt_gpu_state {
     // emit step). Lives on backend so embed-row-gather is a backend op.
     ggml_tensor* tok_id = nullptr;
 
-    // Megakernel-v0 lap-7 multi-block scratch buffers. Allocated alongside
-    // h0/c0/h1/c1 in state_buf so they have stable device pointers across
-    // all calls (CUDA-graph-replayable).
-    //
-    //   gates_buf [4H] F32 — both LSTM layers stream their gate dot products
-    //                        through this buffer between the gates kernel
-    //                        and the activate kernel. Layer 0 → activate 0
-    //                        → layer 1 (overwrites buffer) → activate 1.
-    //   mid_buf   [J]  F32 — joint head stage 1 ReLU intermediate. Read by
-    //                        stage 2 (logits) to produce final V-element
-    //                        output.
-    ggml_tensor* gates_buf = nullptr;
-    ggml_tensor* mid_buf   = nullptr;
-
     // Lap-6 lever D2: persistent step graphs. Build once, reuse forever —
     // shapes are stable so there is no reason to rebuild the cgraph each
     // call. Saves the per-call ggml_init + tensor allocation + graph
@@ -1460,29 +1446,24 @@ static void parakeet_tdt_gpu_init(parakeet_context* ctx) {
     const int D = (int)ctx->model.hparams.d_model;
 
     ggml_init_params p = {
-        /*mem_size=*/ggml_tensor_overhead() * 32,
+        /*mem_size=*/ggml_tensor_overhead() * 16,
         /*mem_buffer=*/nullptr,
         /*no_alloc=*/true,
     };
     s.state_ctx = ggml_init(p);
 
-    const int J = (int)ctx->model.hparams.joint_hidden;
     s.h0 = ggml_new_tensor_1d(s.state_ctx, GGML_TYPE_F32, H);
     s.c0 = ggml_new_tensor_1d(s.state_ctx, GGML_TYPE_F32, H);
     s.h1 = ggml_new_tensor_1d(s.state_ctx, GGML_TYPE_F32, H);
     s.c1 = ggml_new_tensor_1d(s.state_ctx, GGML_TYPE_F32, H);
     s.enc_t = ggml_new_tensor_1d(s.state_ctx, GGML_TYPE_F32, D);
     s.tok_id = ggml_new_tensor_1d(s.state_ctx, GGML_TYPE_I32, 1);
-    s.gates_buf = ggml_new_tensor_1d(s.state_ctx, GGML_TYPE_F32, 4 * H);
-    s.mid_buf   = ggml_new_tensor_1d(s.state_ctx, GGML_TYPE_F32, J);
     ggml_set_name(s.h0, "tdt.h0");
     ggml_set_name(s.c0, "tdt.c0");
     ggml_set_name(s.h1, "tdt.h1");
     ggml_set_name(s.c1, "tdt.c1");
     ggml_set_name(s.enc_t, "tdt.enc_t");
     ggml_set_name(s.tok_id, "tdt.tok_id");
-    ggml_set_name(s.gates_buf, "tdt.gates_buf");
-    ggml_set_name(s.mid_buf, "tdt.mid_buf");
 
     s.state_buf = ggml_backend_alloc_ctx_tensors(s.state_ctx, ctx->backend);
     if (!s.state_buf) {
@@ -1547,38 +1528,6 @@ static lstm_layer_out tdt_gpu_lstm_layer(ggml_context* ctx0, ggml_tensor* x,
     return {h_new, c_new};
 }
 
-// Read PARAKEET_MEGAKERNEL toggle once. Default OFF — needs explicit
-// opt-in until parity is verified per MEGAKERNEL-SPEC.md Gate 1. The
-// builder also gates on weight types (F16 only, see uses below); we
-// log on first call when the flag was set but the gate fell through,
-// so the user notices a silent quant fallback.
-static inline bool parakeet_megakernel_enabled() {
-    static int cached = -1;
-    if (cached < 0) {
-        const char* e = getenv("PARAKEET_MEGAKERNEL");
-        cached = (e && e[0] && e[0] != '0' && strcmp(e, "false") != 0) ? 1 : 0;
-    }
-    return cached != 0;
-}
-
-static inline bool parakeet_megakernel_predictor_eligible(const parakeet_predictor& p) {
-    // Embedding lookup + 4 LSTM weight matrices must be F16. Biases must
-    // be F32 (they always are at GGUF load time — quantize.cpp leaves
-    // 1D tensors alone). The kernel asserts on type mismatch so this
-    // gate exists to choose the fused vs. multi-op build path.
-    return p.embed_w    && p.embed_w->type    == GGML_TYPE_F16
-        && p.lstm0_w_ih && p.lstm0_w_ih->type == GGML_TYPE_F16
-        && p.lstm0_w_hh && p.lstm0_w_hh->type == GGML_TYPE_F16
-        && p.lstm1_w_ih && p.lstm1_w_ih->type == GGML_TYPE_F16
-        && p.lstm1_w_hh && p.lstm1_w_hh->type == GGML_TYPE_F16;
-}
-
-static inline bool parakeet_megakernel_joint_eligible(const parakeet_joint& j) {
-    return j.enc_w  && j.enc_w->type  == GGML_TYPE_F16
-        && j.pred_w && j.pred_w->type == GGML_TYPE_F16
-        && j.out_w  && j.out_w->type  == GGML_TYPE_F16;
-}
-
 // Build the predictor graph into the supplied ggml_context. Caller owns
 // ctx0 — this function does NOT call ggml_free on it. Used both by the
 // per-call legacy path (which allocates + frees its own ctx0 wrapper)
@@ -1589,33 +1538,6 @@ static ggml_cgraph* parakeet_build_predictor_graph_into(parakeet_context* ctx, g
     auto& p = ctx->model.predictor;
     const int H = (int)ctx->model.hparams.pred_hidden;
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 256, false);
-
-    // Megakernel-v0 fused path: 16 ggml ops -> 1. State writeback is
-    // in-place inside the kernel via raw pointers to s.h0/c0/h1/c1's
-    // backing storage (already-allocated persistent state_buf), so no
-    // ggml_cpy ops needed — they were the dispatch overhead the
-    // megakernel exists to eliminate.
-    if (parakeet_megakernel_enabled() && parakeet_megakernel_predictor_eligible(p)) {
-        ggml_tensor* mega = ggml_parakeet_lstm_step(ctx0,
-            p.embed_w,
-            p.lstm0_w_ih, p.lstm0_b_ih, p.lstm0_w_hh, p.lstm0_b_hh,
-            p.lstm1_w_ih, p.lstm1_b_ih, p.lstm1_w_hh, p.lstm1_b_hh,
-            s.h0, s.c0, s.h1, s.c1, s.tok_id, s.gates_buf);
-        ggml_set_name(mega, "tdt.lstm_step");
-        ggml_build_forward_expand(gf, mega);
-        return gf;
-    } else if (parakeet_megakernel_enabled()) {
-        static bool warned = false;
-        if (!warned) {
-            warned = true;
-            fprintf(stderr,
-                "parakeet: PARAKEET_MEGAKERNEL=1 but predictor weights are not F16 "
-                "(embed=%s lstm0_w_ih=%s) — falling back to multi-op cgraph build "
-                "(quant variants are MEGAKERNEL-SPEC.md Commit 4)\n",
-                p.embed_w    ? ggml_type_name(p.embed_w->type)    : "?",
-                p.lstm0_w_ih ? ggml_type_name(p.lstm0_w_ih->type) : "?");
-        }
-    }
 
     // x = embed_w[tok_id]. embed_w is [H, vocab+1], gather row.
     ggml_tensor* x_row = ggml_get_rows(ctx0, p.embed_w, s.tok_id);
@@ -1658,29 +1580,6 @@ static ggml_cgraph* parakeet_build_joint_graph_into(parakeet_context* ctx, ggml_
     auto& s = ctx->tdt_gpu;
     auto& j = ctx->model.joint;
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 64, false);
-
-    // Megakernel-v0 fused path: 8 ggml ops -> 1.
-    if (parakeet_megakernel_enabled() && parakeet_megakernel_joint_eligible(j)) {
-        ggml_tensor* logits = ggml_parakeet_joint(ctx0,
-            j.enc_w,  j.enc_b,
-            j.pred_w, j.pred_b,
-            j.out_w,  j.out_b,
-            s.enc_t,  s.h1, s.mid_buf);
-        ggml_set_name(logits, "tdt.logits");
-        ggml_build_forward_expand(gf, logits);
-        return gf;
-    } else if (parakeet_megakernel_enabled()) {
-        static bool warned = false;
-        if (!warned) {
-            warned = true;
-            fprintf(stderr,
-                "parakeet: PARAKEET_MEGAKERNEL=1 but joint weights are not F16 "
-                "(enc=%s pred=%s out=%s) — falling back to multi-op cgraph build\n",
-                j.enc_w  ? ggml_type_name(j.enc_w->type)  : "?",
-                j.pred_w ? ggml_type_name(j.pred_w->type) : "?",
-                j.out_w  ? ggml_type_name(j.out_w->type)  : "?");
-        }
-    }
 
     // joint_in_e = enc_w @ enc_t + enc_b      [joint_hidden]
     ggml_tensor* je = ggml_add(ctx0, ggml_mul_mat(ctx0, j.enc_w, s.enc_t), j.enc_b);

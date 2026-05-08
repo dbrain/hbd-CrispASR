@@ -221,13 +221,7 @@
 
 #define GGML_MAX_DIMS           4
 #define GGML_MAX_PARAMS         2048
-// Local fork bump (parakeet.cpp megakernel-v0): predictor LSTM step
-// fuses 14 source tensors into a single ggml node (embed_w + 8 LSTM
-// weights + 4 persistent state tensors + tok_id). Upstream uses 10.
-// Each ggml_tensor grows by 6 pointers = 48 bytes; cost is trivial at
-// our op counts. Guarded by GGML_MAX_SRC throughout the codebase, so
-// raising the ceiling does not change behaviour for any other op.
-#define GGML_MAX_SRC            16
+#define GGML_MAX_SRC            10
 #define GGML_MAX_N_THREADS      512
 #define GGML_MAX_OP_PARAMS      64
 
@@ -582,16 +576,6 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
-
-        // parakeet.cpp megakernel-v0 (local fork only). Fuses the
-        // decode-side step graphs (predictor LSTM + joint head) into
-        // single ggml nodes so each per-step graph contains exactly
-        // one op. Drops the per-call ggml-cuda dispatch wrapper cost
-        // from 16-op × ~4 µs / 8-op × ~4 µs down to 1-op × ~4 µs.
-        // CUDA-only; CPU dispatch aborts. See
-        // ggml/src/ggml-cuda/parakeet_megakernel.cu.
-        GGML_OP_PARAKEET_LSTM_STEP,
-        GGML_OP_PARAKEET_JOINT,
 
         GGML_OP_COUNT,
     };
@@ -2731,101 +2715,6 @@ extern "C" {
     // calls and would otherwise pay the property-walk overhead. Pass any
     // nonzero value, kept stable across reuse.
     GGML_API void   ggml_graph_set_uid(struct ggml_cgraph * cgraph, uint64_t uid);
-
-    // ----- parakeet.cpp megakernel-v0 builders (local fork) ----------------
-    //
-    // Both nodes are GPU-only (CUDA backend). Sched / CPU dispatch will
-    // abort if invoked. Caller is expected to gate construction at the
-    // graph builder level (see parakeet_build_predictor_graph_into and
-    // parakeet_build_joint_graph_into in src/parakeet.cpp), and only emit
-    // the fused op when (a) backend is CUDA, (b) all weight tensors are
-    // F16 (the kernel does not yet implement quant fast paths).
-    //
-    // ggml_parakeet_lstm_step:
-    //   2-layer LSTM fused with embed lookup + state writeback. Reads
-    //   embed_w[tok_id, :], runs both LSTM layers, writes h0/c0/h1/c1
-    //   back in place via raw device pointers (the state tensors are
-    //   src[] for graph-topology / scheduler purposes; allocator ignores
-    //   them because they already have buffer/data set by the persistent
-    //   state_buf in tdt_gpu_init).
-    //
-    //   Source ordering (15 entries, fits with GGML_MAX_SRC bumped to 16):
-    //     [0]  embed_w        F16   ne=[H, vocab+1]
-    //     [1]  lstm0_w_ih     F16   ne=[H, 4H]
-    //     [2]  lstm0_b_ih     F32   ne=[4H]
-    //     [3]  lstm0_w_hh     F16   ne=[H, 4H]
-    //     [4]  lstm0_b_hh     F32   ne=[4H]
-    //     [5]  lstm1_w_ih     F16   ne=[H, 4H]
-    //     [6]  lstm1_b_ih     F32   ne=[4H]
-    //     [7]  lstm1_w_hh     F16   ne=[H, 4H]
-    //     [8]  lstm1_b_hh     F32   ne=[4H]
-    //     [9]  h0             F32   ne=[H]    read+write (persistent)
-    //     [10] c0             F32   ne=[H]    read+write
-    //     [11] h1             F32   ne=[H]    read+write
-    //     [12] c1             F32   ne=[H]    read+write
-    //     [13] tok_id         I32   ne=[1]
-    //     [14] gates_buf      F32   ne=[4H]   scratch (multi-block fused)
-    //
-    //   Returned tensor is a [1] F32 placeholder ("megakernel result"). The
-    //   meaningful outputs are the in-place mutations on h0/c0/h1/c1; the
-    //   placeholder exists only so the graph has a node to schedule.
-    //   gates_buf is a stream-private scratch tensor used to chain the
-    //   gates and activate sub-kernels: layer 0 gates writes 4H floats,
-    //   layer 0 activate consumes them, layer 1 gates overwrites, layer 1
-    //   activate consumes. Same backend buffer between sub-kernels.
-    //
-    // ggml_parakeet_joint:
-    //   2-stage joint head (enc_proj + pred_proj → ReLU → out_proj). Reads
-    //   enc_t and h1 (persistent), writes logits to the returned tensor.
-    //   Source ordering (8 entries):
-    //     [0] enc_w   F16  ne=[D, J]
-    //     [1] enc_b   F32  ne=[J]
-    //     [2] pred_w  F16  ne=[P, J]
-    //     [3] pred_b  F32  ne=[J]
-    //     [4] out_w   F16  ne=[J, V]
-    //     [5] out_b   F32  ne=[V]
-    //     [6] enc_t   F32  ne=[D]
-    //     [7] h1      F32  ne=[P]
-    //   Returned tensor is [V] F32 logits (read back via tensor_get).
-    GGML_API struct ggml_tensor * ggml_parakeet_lstm_step(
-        struct ggml_context * ctx,
-        struct ggml_tensor * embed_w,
-        struct ggml_tensor * lstm0_w_ih,
-        struct ggml_tensor * lstm0_b_ih,
-        struct ggml_tensor * lstm0_w_hh,
-        struct ggml_tensor * lstm0_b_hh,
-        struct ggml_tensor * lstm1_w_ih,
-        struct ggml_tensor * lstm1_b_ih,
-        struct ggml_tensor * lstm1_w_hh,
-        struct ggml_tensor * lstm1_b_hh,
-        struct ggml_tensor * h0,
-        struct ggml_tensor * c0,
-        struct ggml_tensor * h1,
-        struct ggml_tensor * c1,
-        struct ggml_tensor * tok_id,
-        struct ggml_tensor * gates_buf);
-
-    // Joint head — multi-block fused. Source ordering (9 entries):
-    //   [0] enc_w     F16  ne=[D, J]
-    //   [1] enc_b     F32  ne=[J]
-    //   [2] pred_w    F16  ne=[P, J]
-    //   [3] pred_b    F32  ne=[J]
-    //   [4] out_w     F16  ne=[J, V]
-    //   [5] out_b     F32  ne=[V]
-    //   [6] enc_t     F32  ne=[D]
-    //   [7] h1        F32  ne=[P]
-    //   [8] mid_buf   F32  ne=[J]    scratch (stage-1 ReLU intermediate)
-    GGML_API struct ggml_tensor * ggml_parakeet_joint(
-        struct ggml_context * ctx,
-        struct ggml_tensor * enc_w,
-        struct ggml_tensor * enc_b,
-        struct ggml_tensor * pred_w,
-        struct ggml_tensor * pred_b,
-        struct ggml_tensor * out_w,
-        struct ggml_tensor * out_b,
-        struct ggml_tensor * enc_t,
-        struct ggml_tensor * h1,
-        struct ggml_tensor * mid_buf);
 
     GGML_API size_t ggml_graph_overhead(void);
     GGML_API size_t ggml_graph_overhead_custom(size_t size, bool grads);

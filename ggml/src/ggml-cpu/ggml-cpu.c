@@ -2083,16 +2083,6 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_opt_step_sgd(params, tensor);
             }
             break;
-        case GGML_OP_PARAKEET_LSTM_STEP:
-        case GGML_OP_PARAKEET_JOINT:
-            {
-                // parakeet.cpp megakernel-v0 ops are CUDA-only. The CPU
-                // backend has no implementation and the graph builder is
-                // expected to gate emission on backend type; reaching this
-                // path means the gate failed.
-                GGML_ABORT("parakeet megakernel: CPU backend not supported");
-            }
-            break;
         case GGML_OP_NONE:
             {
                 // nop
@@ -2323,8 +2313,6 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_TRANSPOSE:
         case GGML_OP_GET_ROWS_BACK:
         case GGML_OP_DIAG:
-        case GGML_OP_PARAKEET_LSTM_STEP:
-        case GGML_OP_PARAKEET_JOINT:
             {
                 n_tasks = 1;
             } break;
