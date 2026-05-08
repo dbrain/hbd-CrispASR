@@ -210,6 +210,33 @@ struct parakeet_vocab {
     std::unordered_map<std::string, int> token_to_id;
 };
 
+// ---------------------------------------------------------------------------
+// GPU mel STFT state (lap-3 lever A).
+//
+// The mel preprocessor used to be a hand-rolled CPU FFT (~78 ms / 30 s clip).
+// Lap-3 moves it onto the same backend as the encoder by expressing the STFT
+// as two F32 GEMMs against pre-baked DFT bases. The persistent constants here
+// (dft_real, dft_imag, window_padded) are uploaded once at init and reused
+// across every transcribe.
+// ---------------------------------------------------------------------------
+struct parakeet_mel_gpu_state {
+    bool initialised = false;
+    bool ever_used = false;
+
+    ggml_context* state_ctx = nullptr;
+    ggml_backend_buffer_t state_buf = nullptr;
+
+    // dft_real[k, n] = cos(2π k n / N),
+    // dft_imag[k, n] = -sin(2π k n / N).
+    // Stored row-major flat[k * n_fft + n] → ne = [n_fft, n_freqs].
+    ggml_tensor* dft_real = nullptr;
+    ggml_tensor* dft_imag = nullptr;
+    // window center-padded from win_length to n_fft (preprocessor.window
+    // padded once at init so the mel graph can elementwise-multiply against
+    // it without a per-call resize).
+    ggml_tensor* window_padded = nullptr;
+};
+
 struct parakeet_tdt_gpu_state {
     bool initialised = false;
     bool ever_used = false;            // false until first GPU decode call
@@ -252,6 +279,9 @@ struct parakeet_context {
 
     // GPU TDT decode state (PARAKEET_TDT_GPU=1). Lazy.
     parakeet_tdt_gpu_state tdt_gpu;
+
+    // GPU mel STFT state (PARAKEET_MEL_GPU=1, default on). Lazy.
+    parakeet_mel_gpu_state mel_gpu;
 
     int n_threads = 4;
 
@@ -557,6 +587,255 @@ static std::vector<float> parakeet_compute_mel_impl(parakeet_context* ctx, const
 
     auto mel = core_mel::compute(samples, n_samples, window_raw.data(), win, mel_fb.data(), n_freqs, parakeet_fft_r2c,
                                  p, T_out);
+    return mel;
+}
+
+// ===========================================================================
+// GPU mel STFT (lap-3 lever A)
+//
+// Replaces the ~78 ms CPU FFT path with a ggml graph on `ctx->backend`.
+// The STFT is expressed as two F32 GEMMs against precomputed DFT bases:
+//
+//   frames[n, t] = pad(samples)[t * hop + n] * window[n]              (im2col + mul)
+//   STFT_real[k, t] = Σ_n cos(2π k n / N) * frames[n, t]              (mul_mat #1)
+//   STFT_imag[k, t] = Σ_n -sin(2π k n / N) * frames[n, t]             (mul_mat #2)
+//   power[k, t]     = STFT_real[k, t]² + STFT_imag[k, t]²
+//   mel[m, t]       = Σ_k mel_fb[m, k] * power[k, t]                  (mul_mat #3)
+//   log_mel         = ln(mel + 2⁻²⁴)
+//   normed[m, t]    = (log_mel[m, t] - mean[m]) / (std[m] + 1e-5)     (per-feature z-score)
+//
+// Pre-emphasis (y[i] = x[i] - 0.97·x[i-1]) and the center-pad still run on
+// the CPU before upload — both are O(n_samples) memcpy-class ops, not worth
+// porting. NeMo applies the pre-emphasis BEFORE center-pad so the high-pass
+// filter sees the true first sample, not a zero.
+//
+// Output ne[0]=n_mels, ne[1]=T_mel — same layout as the legacy CPU path so
+// the encoder graph consumes it unchanged.
+// ===========================================================================
+
+static void parakeet_mel_gpu_init(parakeet_context* ctx) {
+    if (ctx->mel_gpu.initialised)
+        return;
+    auto& s = ctx->mel_gpu;
+    auto& m = ctx->model;
+    const int n_fft = (int)m.hparams.n_fft;
+    const int n_freqs = n_fft / 2 + 1;
+    const int win = (int)m.hparams.win_length;
+
+    if (!m.mel_fb || !m.mel_window) {
+        fprintf(stderr, "parakeet: mel_gpu init: missing preprocessor.fb / preprocessor.window\n");
+        return;
+    }
+
+    ggml_init_params p = {
+        /*mem_size=*/ggml_tensor_overhead() * 8,
+        /*mem_buffer=*/nullptr,
+        /*no_alloc=*/true,
+    };
+    s.state_ctx = ggml_init(p);
+
+    s.dft_real = ggml_new_tensor_2d(s.state_ctx, GGML_TYPE_F32, n_fft, n_freqs);
+    s.dft_imag = ggml_new_tensor_2d(s.state_ctx, GGML_TYPE_F32, n_fft, n_freqs);
+    s.window_padded = ggml_new_tensor_1d(s.state_ctx, GGML_TYPE_F32, n_fft);
+    ggml_set_name(s.dft_real, "mel.dft_real");
+    ggml_set_name(s.dft_imag, "mel.dft_imag");
+    ggml_set_name(s.window_padded, "mel.window_padded");
+
+    s.state_buf = ggml_backend_alloc_ctx_tensors(s.state_ctx, ctx->backend);
+    if (!s.state_buf) {
+        fprintf(stderr, "parakeet: mel_gpu state alloc failed (backend=%p)\n", (void*)ctx->backend);
+        ggml_free(s.state_ctx);
+        s.state_ctx = nullptr;
+        return;
+    }
+
+    // Build DFT basis: dft_real[k, n] = cos(2π k n / N), dft_imag = -sin(...).
+    // Flat layout flat[k * n_fft + n] matches ne=[n_fft, n_freqs] (n is fastest).
+    std::vector<float> real((size_t)n_fft * n_freqs);
+    std::vector<float> imag((size_t)n_fft * n_freqs);
+    const double two_pi_over_N = -2.0 * M_PI / (double)n_fft;
+    for (int k = 0; k < n_freqs; k++) {
+        for (int n = 0; n < n_fft; n++) {
+            const double ang = two_pi_over_N * (double)k * (double)n;
+            real[(size_t)k * n_fft + n] = (float)cos(ang);
+            imag[(size_t)k * n_fft + n] = (float)sin(ang); // sin(-x) = -sin(x) — already negated by sign in `ang`.
+        }
+    }
+    ggml_backend_tensor_set(s.dft_real, real.data(), 0, real.size() * sizeof(float));
+    ggml_backend_tensor_set(s.dft_imag, imag.data(), 0, imag.size() * sizeof(float));
+
+    // Center-pad the window from win_length to n_fft (zero-padded on each side).
+    std::vector<float> win_raw((size_t)win);
+    ggml_backend_tensor_get(m.mel_window, win_raw.data(), 0, win * sizeof(float));
+    std::vector<float> wpad((size_t)n_fft, 0.0f);
+    const int lpad = (n_fft - win) / 2;
+    for (int i = 0; i < win; i++)
+        wpad[lpad + i] = win_raw[i];
+    ggml_backend_tensor_set(s.window_padded, wpad.data(), 0, wpad.size() * sizeof(float));
+
+    s.initialised = true;
+    if (getenv("PARAKEET_DEBUG"))
+        fprintf(stderr, "parakeet: mel_gpu state init OK (n_fft=%d, n_freqs=%d, win=%d)\n", n_fft, n_freqs, win);
+}
+
+static ggml_cgraph* parakeet_build_graph_mel(parakeet_context* ctx, int n_samples_padded, int T_mel) {
+    auto& m = ctx->model;
+    auto& s = ctx->mel_gpu;
+    const auto& hp = m.hparams;
+    const int n_fft = (int)hp.n_fft;
+    const int n_mels = (int)hp.n_mels;
+    const int hop = (int)hp.hop_length;
+
+    ggml_init_params ip = {
+        /*mem_size=*/ctx->compute_meta.size(),
+        /*mem_buffer=*/ctx->compute_meta.data(),
+        /*no_alloc=*/true,
+    };
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 256, false);
+
+    // Input: pre-emphasized + center-padded samples in F32. ne=[N, 1, 1, 1] so
+    // im2col can treat the time axis as the conv "width".
+    ggml_tensor* samples = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_samples_padded, 1, 1, 1);
+    ggml_set_name(samples, "mel_samples");
+    ggml_set_input(samples);
+
+    // im2col over the time axis: kernel = window_padded (only its shape matters
+    // — im2col never reads the kernel data). Output ne=[n_fft, T_mel, 1, 1].
+    ggml_tensor* frames_raw = ggml_im2col(ctx0,
+        /*kernel*/ s.window_padded,
+        /*data*/   samples,
+        /*s0*/ hop, /*s1*/ 0,
+        /*p0*/ 0,   /*p1*/ 0,
+        /*d0*/ 1,   /*d1*/ 0,
+        /*is_2D*/ false,
+        GGML_TYPE_F32);
+    ggml_tensor* frames = ggml_reshape_2d(ctx0, frames_raw, n_fft, T_mel);
+
+    // Window broadcast: window_padded ne=[n_fft] tiles across the T axis.
+    ggml_tensor* windowed = ggml_mul(ctx0, frames, s.window_padded);
+
+    // STFT-as-GEMM. dft_real ne=[n_fft, n_freqs] → mul_mat treats that as
+    // K=n_fft (contracted) × M=n_freqs (output). Result ne=[n_freqs, T_mel].
+    ggml_tensor* stft_real = ggml_mul_mat(ctx0, s.dft_real, windowed);
+    ggml_tensor* stft_imag = ggml_mul_mat(ctx0, s.dft_imag, windowed);
+
+    // Power = real² + imag².
+    ggml_tensor* power = ggml_add(ctx0, ggml_sqr(ctx0, stft_real), ggml_sqr(ctx0, stft_imag));
+
+    // Mel projection. mel_fb stored flat[m * n_freqs + k] ⇒ ne=[n_freqs, n_mels].
+    // mul_mat(mel_fb, power) → ne=[n_mels, T_mel] with out[m, t] = Σ_k mel_fb[m, k] * power[k, t].
+    ggml_tensor* mel = ggml_mul_mat(ctx0, m.mel_fb, power);
+
+    // log(x + 2⁻²⁴). NeMo's log_zero_guard_value (AddEpsilon path).
+    const float log_eps = 1.0f / (float)(1 << 24);
+    ggml_tensor* log_mel = ggml_log(ctx0, ggml_scale_bias(ctx0, mel, 1.0f, log_eps));
+
+    // Per-feature z-score across T_mel for each mel band.
+    //
+    //   var = Σ (x - mean)² / (T_mel - 1)        (Bessel-corrected, NeMo)
+    //   std = sqrt(var) + 1e-5                   (eps OUTSIDE the sqrt — see core_mel)
+    //   y   = (x - mean) / std
+    //
+    // Implementation: transpose to ne=[T_mel, n_mels] so ggml_sum_rows reduces
+    // along the time axis, then normalize, then transpose back. Both
+    // transposes are zero-copy views; the trailing ggml_cont materializes the
+    // [n_mels, T_mel] layout the encoder graph expects.
+    ggml_tensor* mel_t = ggml_cont(ctx0, ggml_transpose(ctx0, log_mel)); // [T_mel, n_mels]
+
+    const float inv_T = 1.0f / (float)T_mel;
+    const int denom = (T_mel > 1) ? (T_mel - 1) : 1;
+    const float inv_denom = 1.0f / (float)denom;
+
+    ggml_tensor* mean = ggml_scale(ctx0, ggml_sum_rows(ctx0, mel_t), inv_T); // [1, n_mels]
+    ggml_tensor* center = ggml_sub(ctx0, mel_t, mean);                       // [T_mel, n_mels]
+    ggml_tensor* var = ggml_scale(ctx0, ggml_sum_rows(ctx0, ggml_sqr(ctx0, center)), inv_denom); // [1, n_mels]
+    ggml_tensor* std_v = ggml_scale_bias(ctx0, ggml_sqrt(ctx0, var), 1.0f, 1e-5f);                // [1, n_mels]
+    ggml_tensor* normed_t = ggml_div(ctx0, center, std_v);                                        // [T_mel, n_mels]
+    ggml_tensor* mel_out = ggml_cont(ctx0, ggml_transpose(ctx0, normed_t));                        // [n_mels, T_mel]
+
+    ggml_set_name(mel_out, "mel_out");
+    ggml_set_output(mel_out);
+    ggml_build_forward_expand(gf, mel_out);
+    ggml_free(ctx0);
+    return gf;
+}
+
+// Pre-emphasis + center-pad on the CPU, GPU mel graph for everything else.
+// Returns the mel buffer as a flat F32 [n_mels * T_mel] in the same layout
+// (n_mels fastest) as parakeet_compute_mel_impl, so the encoder caller is
+// untouched. Sets T_out and returns an empty vector on failure.
+static std::vector<float> parakeet_compute_mel_gpu(parakeet_context* ctx, const float* samples, int n_samples,
+                                                   int& T_out) {
+    parakeet_mel_gpu_init(ctx);
+    if (!ctx->mel_gpu.initialised) {
+        T_out = 0;
+        return {};
+    }
+
+    const auto& hp = ctx->model.hparams;
+    const int n_fft = (int)hp.n_fft;
+    const int hop = (int)hp.hop_length;
+    const int n_mels = (int)hp.n_mels;
+
+    // Pre-emphasis + center-pad on the host. The padded buffer goes straight
+    // into the GPU input tensor, so we only allocate one std::vector here.
+    const int pad = n_fft / 2;
+    const int padded_len = n_samples + 2 * pad;
+    std::vector<float> padded((size_t)padded_len, 0.0f);
+    if (n_samples > 0) {
+        const float a = 0.97f;
+        // y[0] = x[0]; y[i] = x[i] - α * x[i-1] (NeMo convention).
+        padded[pad] = samples[0];
+        for (int i = 1; i < n_samples; i++)
+            padded[pad + i] = samples[i] - a * samples[i - 1];
+    }
+
+    int T_mel = padded_len >= n_fft ? (padded_len - n_fft) / hop + 1 : 0;
+    if (T_mel <= 0) {
+        T_out = 0;
+        return {};
+    }
+
+    if (!ctx->sched) {
+        ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
+        int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
+        ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 8192, false, false);
+    }
+    if (ctx->compute_meta.empty()) {
+        ctx->compute_meta.resize(ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false));
+    }
+
+    ggml_cgraph* gf = parakeet_build_graph_mel(ctx, padded_len, T_mel);
+
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        fprintf(stderr, "parakeet: mel_gpu graph alloc failed\n");
+        T_out = 0;
+        return {};
+    }
+
+    ggml_tensor* in = ggml_graph_get_tensor(gf, "mel_samples");
+    ggml_backend_tensor_set(in, padded.data(), 0, padded.size() * sizeof(float));
+
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "parakeet: mel_gpu graph compute failed\n");
+        T_out = 0;
+        return {};
+    }
+
+    ggml_tensor* out = ggml_graph_get_tensor(gf, "mel_out");
+    if (!out || (int)out->ne[0] != n_mels || (int)out->ne[1] != T_mel) {
+        fprintf(stderr, "parakeet: mel_gpu out shape mismatch (got [%d,%d], want [%d,%d])\n",
+                out ? (int)out->ne[0] : -1, out ? (int)out->ne[1] : -1, n_mels, T_mel);
+        T_out = 0;
+        return {};
+    }
+
+    std::vector<float> mel((size_t)n_mels * T_mel);
+    ggml_backend_tensor_get(out, mel.data(), 0, mel.size() * sizeof(float));
+    ctx->mel_gpu.ever_used = true;
+    T_out = T_mel;
     return mel;
 }
 
@@ -1685,6 +1964,10 @@ extern "C" void parakeet_free(struct parakeet_context* ctx) {
         ggml_backend_buffer_free(ctx->tdt_gpu.state_buf);
     if (ctx->tdt_gpu.state_ctx)
         ggml_free(ctx->tdt_gpu.state_ctx);
+    if (ctx->mel_gpu.state_buf)
+        ggml_backend_buffer_free(ctx->mel_gpu.state_buf);
+    if (ctx->mel_gpu.state_ctx)
+        ggml_free(ctx->mel_gpu.state_ctx);
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->model.buf)
@@ -1991,10 +2274,28 @@ extern "C" struct parakeet_result* parakeet_transcribe_ex(struct parakeet_contex
     tim_local.on = parakeet_timing_enabled();
     parakeet_timing* tim = tim_local.on ? &tim_local : nullptr;
 
-    // 1. Mel
+    // 1. Mel. GPU path (lap-3 lever A) is the default; PARAKEET_MEL_GPU=0 forces
+    // the legacy CPU FFT (Cooley-Tukey + scalar mel projection).
+    static int mel_gpu_cached = -1;
+    if (mel_gpu_cached < 0) {
+        const char* e = getenv("PARAKEET_MEL_GPU");
+        if (e && *e && (strcmp(e, "0") == 0 || strcmp(e, "false") == 0))
+            mel_gpu_cached = 0;
+        else
+            mel_gpu_cached = 1;
+    }
     int T_mel = 0;
     auto _t_mel = clk::now();
-    auto mel = parakeet_compute_mel_impl(ctx, samples, n_samples, T_mel);
+    std::vector<float> mel;
+    if (mel_gpu_cached) {
+        mel = parakeet_compute_mel_gpu(ctx, samples, n_samples, T_mel);
+        if (mel.empty() && !ctx->mel_gpu.ever_used) {
+            // GPU init failed (e.g. CPU-only build): fall back to CPU once.
+            mel = parakeet_compute_mel_impl(ctx, samples, n_samples, T_mel);
+        }
+    } else {
+        mel = parakeet_compute_mel_impl(ctx, samples, n_samples, T_mel);
+    }
     if (tim) tim->t_mel_ms = ms_since(_t_mel);
     if (mel.empty())
         return nullptr;
