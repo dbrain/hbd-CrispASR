@@ -180,14 +180,6 @@ struct BlockParams {
     int head_dim; // d / n_heads
     int K;        // conv_kernel (usually 9)
     float ln_eps; // LayerNorm epsilon
-
-    // Opt-in to ggml_flash_attn_ext for the self-attention path. Default
-    // false to preserve the legacy explicit-MHA path used by canary /
-    // canary_ctc / parakeet pre-lap-4. When true, the rel-pos BD term is
-    // pre-scaled by 1/sqrt(head_dim), cast to F16, and passed as the FA
-    // mask. Heads are routed through ne[3] so the CUDA FA kernel's
-    // mask->ne[2]==1 constraint is satisfied (per fattn.cu:423).
-    bool use_fa = false;
 };
 
 // Build one Conformer block. `cur` must be (d, T). `pos_enc` is the shared
@@ -232,88 +224,22 @@ static inline ggml_tensor* build_block(ggml_context* ctx0, ggml_tensor* cur, ggm
     ggml_tensor* Q_u = ggml_add(ctx0, Q, ggml_reshape_1d(ctx0, e.pos_bias_u, d));
     ggml_tensor* Q_v = ggml_add(ctx0, Q, ggml_reshape_1d(ctx0, e.pos_bias_v, d));
 
-    const float attn_scale = 1.0f / sqrtf((float)head_dim);
-    ggml_tensor* attn_out = nullptr;
+    Q_u = ggml_permute(ctx0, ggml_reshape_3d(ctx0, Q_u, head_dim, n_heads, T), 0, 2, 1, 3);
+    Q_v = ggml_permute(ctx0, ggml_reshape_3d(ctx0, Q_v, head_dim, n_heads, T), 0, 2, 1, 3);
+    K_ = ggml_permute(ctx0, ggml_reshape_3d(ctx0, K_, head_dim, n_heads, T), 0, 2, 1, 3);
+    R = ggml_permute(ctx0, ggml_reshape_3d(ctx0, R, head_dim, n_heads, 2 * T - 1), 0, 2, 1, 3);
 
-    if (p.use_fa) {
-        // ---- Flash-attn path (lap-4 lever B1) ----
-        //
-        // The CUDA FA kernel selector requires mask->ne[2] == 1 (see
-        // ggml/src/ggml-cuda/fattn.cu:423). Parakeet's BD rel-pos bias is
-        // *per-head*, so we cannot simply pass it as a [T, T, n_heads]
-        // mask in the legacy n_heads-on-ne[2] layout.
-        //
-        // Workaround: route n_heads through ne[3] (treat heads as the
-        // "batch" axis from FA's POV). Q/K/V become [head_dim, T, 1, n_heads],
-        // and the mask becomes [T, T, 1, n_heads] which trivially has
-        // ne[2]==1. q->ne[3] % mask->ne[3] == 0 still holds.
-        //
-        // FA applies `scale` only to the Q@K term; the mask is added AFTER
-        // scaling. The legacy path computes scores = scale*(AC + BD), so we
-        // pre-scale BD by `attn_scale` before passing it as the mask to
-        // preserve numerical equivalence.
-        //
-        // ggml_permute(a, axis0, axis1, axis2, axis3) sends src axis `i` to
-        // the dst position given by `axis_i`. To map src ne=[head_dim,
-        // n_heads, T, 1] → dst ne=[head_dim, T, 1, n_heads]:
-        //   src 0 (head_dim) → dst 0
-        //   src 1 (n_heads)  → dst 3
-        //   src 2 (T)        → dst 1
-        //   src 3 (1)        → dst 2
-        // i.e. permute(0, 3, 1, 2).
-        ggml_tensor* Qf = ggml_cont(ctx0,
-            ggml_permute(ctx0, ggml_reshape_3d(ctx0, Q_u, head_dim, n_heads, T), 0, 3, 1, 2));
-        // Q_v keeps the legacy n_heads-on-ne[2] layout (BD/rel_shift expects it).
-        ggml_tensor* Qvf = ggml_cont(ctx0,
-            ggml_permute(ctx0, ggml_reshape_3d(ctx0, Q_v, head_dim, n_heads, T), 0, 2, 1, 3));
-        ggml_tensor* Kf = ggml_cont(ctx0,
-            ggml_permute(ctx0, ggml_reshape_3d(ctx0, K_, head_dim, n_heads, T), 0, 3, 1, 2));
-        ggml_tensor* Vf = ggml_cont(ctx0,
-            ggml_permute(ctx0, ggml_reshape_3d(ctx0, V, head_dim, n_heads, T), 0, 3, 1, 2));
-        // R: legacy [hd, 2T-1, n_heads, 1] for BD_raw mul_mat / rel_shift.
-        ggml_tensor* Rf = ggml_permute(ctx0,
-            ggml_reshape_3d(ctx0, R, head_dim, n_heads, 2 * T - 1), 0, 2, 1, 3);
+    ggml_tensor* AC = ggml_mul_mat(ctx0, ggml_cont(ctx0, K_), Q_u);
+    ggml_tensor* BD_raw = ggml_mul_mat(ctx0, ggml_cont(ctx0, R), Q_v);
+    ggml_tensor* BD = rel_shift(ctx0, BD_raw);
 
-        // BD_raw[k, t, h] = Σ R[k=k, 2T-1=k', h] · Q_v[k=k, T=t, h]; we keep
-        // n_heads on ne[2] for the mul_mat / rel_shift step (rel_shift walks
-        // a 2D view per head and is happiest with the legacy layout) and
-        // re-permute below.
-        ggml_tensor* BD_raw = ggml_mul_mat(ctx0, ggml_cont(ctx0, Rf), Qvf);
-        ggml_tensor* BD = rel_shift(ctx0, BD_raw); // [T, T, n_heads]
+    ggml_tensor* scores = ggml_add(ctx0, AC, BD);
+    scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f / sqrtf((float)head_dim), 0.0f);
 
-        // Pre-scale → cast → permute to [T, T, 1, n_heads] contiguous F16.
-        ggml_tensor* mask = ggml_scale(ctx0, BD, attn_scale);
-        mask = ggml_cast(ctx0, mask, GGML_TYPE_F16);
-        mask = ggml_cont(ctx0, ggml_permute(ctx0, mask, 0, 1, 3, 2));
-
-        // FA fuses scale·(K^T·Q) + mask + softmax + V·scores.
-        // Output ne = {V.ne[0], Q.ne[2], Q.ne[1], Q.ne[3]} = {head_dim, 1, T, n_heads}.
-        ggml_tensor* fa = ggml_flash_attn_ext(ctx0, Qf, Kf, Vf, mask, attn_scale, 0.0f, 0.0f);
-
-        // [head_dim, 1, T, n_heads] → [head_dim, n_heads, T] via squeeze + permute,
-        // then flatten to [d, T] for the output projection.
-        ggml_tensor* fa3 = ggml_reshape_3d(ctx0, fa, head_dim, T, n_heads);  // squeeze ne[1]==1
-        attn_out = ggml_cont(ctx0, ggml_permute(ctx0, fa3, 0, 2, 1, 3));      // → [head_dim, n_heads, T]
-        attn_out = ggml_reshape_2d(ctx0, attn_out, d, T);
-    } else {
-        // ---- Legacy explicit-MHA path (canary, canary_ctc, pre-lap-4 parakeet) ----
-        Q_u = ggml_permute(ctx0, ggml_reshape_3d(ctx0, Q_u, head_dim, n_heads, T), 0, 2, 1, 3);
-        Q_v = ggml_permute(ctx0, ggml_reshape_3d(ctx0, Q_v, head_dim, n_heads, T), 0, 2, 1, 3);
-        ggml_tensor* Kp = ggml_permute(ctx0, ggml_reshape_3d(ctx0, K_, head_dim, n_heads, T), 0, 2, 1, 3);
-        ggml_tensor* Rp = ggml_permute(ctx0, ggml_reshape_3d(ctx0, R, head_dim, n_heads, 2 * T - 1), 0, 2, 1, 3);
-
-        ggml_tensor* AC = ggml_mul_mat(ctx0, ggml_cont(ctx0, Kp), Q_u);
-        ggml_tensor* BD_raw = ggml_mul_mat(ctx0, ggml_cont(ctx0, Rp), Q_v);
-        ggml_tensor* BD = rel_shift(ctx0, BD_raw);
-
-        ggml_tensor* scores = ggml_add(ctx0, AC, BD);
-        scores = ggml_soft_max_ext(ctx0, scores, nullptr, attn_scale, 0.0f);
-
-        ggml_tensor* V3 = ggml_reshape_3d(ctx0, V, head_dim, n_heads, T);
-        ggml_tensor* V_t = ggml_permute(ctx0, V3, 1, 2, 0, 3);
-        attn_out = ggml_mul_mat(ctx0, ggml_cont(ctx0, V_t), scores);
-        attn_out = ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, attn_out, 0, 2, 1, 3)), d, T);
-    }
+    ggml_tensor* V3 = ggml_reshape_3d(ctx0, V, head_dim, n_heads, T);
+    ggml_tensor* V_t = ggml_permute(ctx0, V3, 1, 2, 0, 3);
+    ggml_tensor* attn_out = ggml_mul_mat(ctx0, ggml_cont(ctx0, V_t), scores);
+    attn_out = ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, attn_out, 0, 2, 1, 3)), d, T);
 
     attn_out = mm_bias(e.attn_out_w, attn_out, e.attn_out_b);
     cur = ggml_add(ctx0, inpAttn, attn_out);

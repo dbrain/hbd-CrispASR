@@ -957,18 +957,8 @@ static ggml_cgraph* parakeet_build_graph_encoder(parakeet_context* ctx, int T_me
     ggml_set_input(pos_enc);
 
     // ----- 24× FastConformer block -----
-    // Lap-4 lever B1: PARAKEET_FA=1 routes self-attn through ggml_flash_attn_ext
-    // with the rel-pos BD term passed as a per-head F16 mask. n_heads is moved
-    // to ne[3] so the CUDA kernel's mask->ne[2]==1 constraint is satisfied
-    // (per fattn.cu:423). Default OFF until parity is verified end-to-end.
-    static int fa_cached = -1;
-    if (fa_cached < 0) {
-        const char* e = getenv("PARAKEET_FA");
-        fa_cached = (e && *e && strcmp(e, "0") != 0 && strcmp(e, "false") != 0) ? 1 : 0;
-    }
     core_conformer::BlockParams bp = {
         (int)hp.d_model, (int)hp.n_heads, (int)hp.head_dim, (int)hp.conv_kernel, kLayerNormEps,
-        /*use_fa=*/(fa_cached != 0),
     };
     for (uint32_t il = 0; il < hp.n_layers; il++) {
         cur = core_conformer::build_block(ctx0, cur, pos_enc, T, m.enc[il], bp);
@@ -986,11 +976,13 @@ static ggml_cgraph* parakeet_build_graph_encoder(parakeet_context* ctx, int T_me
 // Caller computes T_enc as ceil(T_mel / subsampling_factor) (approximately —
 // the actual value depends on the conv arithmetic and is reported back).
 //
-// Lap-4 lever B3: PARAKEET_ENC_CACHE=1 swaps ggml_backend_sched for a
-// dedicated ggml_gallocr_t + direct ggml_backend_graph_compute. Lets the CUDA
-// backend capture one CUDA graph for the whole encoder per stable shape
-// instead of per-sched-split (24+ warmups previously). The gallocr re-uses
-// its backend buffer pool when shapes match across calls. Default OFF.
+// Lap-4 lever B3: dedicated ggml_gallocr_t + direct ggml_backend_graph_compute
+// in place of ggml_backend_sched. Lets the CUDA backend capture one CUDA
+// graph for the whole encoder per stable shape instead of one per sched-split
+// (sched fragmented the encoder into ~24 captures, one per layer; q4_k mean
+// RTF 220→310 once they're collapsed into one). The gallocr re-uses its
+// backend buffer pool when shapes match across calls. Default ON since lap-4;
+// PARAKEET_ENC_CACHE=0 falls back to the lap-3 sched path.
 static std::vector<float> parakeet_encode_mel(parakeet_context* ctx, const float* mel, int n_mels, int T_mel,
                                               int* out_T_enc) {
     if (n_mels != (int)ctx->model.hparams.n_mels) {
@@ -1001,7 +993,11 @@ static std::vector<float> parakeet_encode_mel(parakeet_context* ctx, const float
     static int enc_cache_cached = -1;
     if (enc_cache_cached < 0) {
         const char* e = getenv("PARAKEET_ENC_CACHE");
-        enc_cache_cached = (e && *e && strcmp(e, "0") != 0 && strcmp(e, "false") != 0) ? 1 : 0;
+        // default ON; "0" / "false" disable. Empty / unset → on.
+        if (e && *e && (strcmp(e, "0") == 0 || strcmp(e, "false") == 0))
+            enc_cache_cached = 0;
+        else
+            enc_cache_cached = 1;
     }
 
     if (ctx->compute_meta.empty()) {
