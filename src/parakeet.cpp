@@ -34,6 +34,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <random>
@@ -48,6 +49,54 @@
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+// ===========================================================================
+// Per-stage timing (PARAKEET_TIMING=1)
+//
+// Walltime via std::chrono. The encoder's ggml_backend_sched_graph_compute +
+// ggml_backend_tensor_get pair blocks on the CUDA backend, so chrono captures
+// real GPU time end-to-end without explicit cudaEvent calls. The TDT decode
+// loop is all CPU, so chrono there is exact.
+//
+// Off path: a single getenv() at the start of parakeet_transcribe_ex. The
+// inner-loop counters are plain int/double accumulators that exist
+// unconditionally — branch-predicted, sub-ns overhead.
+// ===========================================================================
+
+struct parakeet_timing {
+    bool on = false;
+
+    // outer
+    double t_mel_ms = 0.0;
+    double t_encoder_ms = 0.0;
+    double t_decode_ms = 0.0;
+
+    // tdt decode breakdown
+    double t_pred_step_ms = 0.0;       // predictor LSTM (CPU)
+    double t_joint_proj_enc_ms = 0.0;  // joint enc projection (CPU, once per t)
+    double t_joint_step_ms = 0.0;      // joint pred-proj + relu + out (CPU, per inner step)
+    double t_argmax_softmax_ms = 0.0;  // argmax over vocab + dur, softmax for tok_p
+
+    int n_inner_steps = 0;             // total joint_step calls
+    int n_emits = 0;                   // tokens emitted
+    int n_blanks = 0;                  // blank steps
+    int n_t_steps = 0;                 // outer t-loop iterations
+    int T_enc = 0;                     // encoder frames (set by encoder timing block)
+};
+
+static inline bool parakeet_timing_enabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* e = getenv("PARAKEET_TIMING");
+        cached = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+static inline double ms_since(const std::chrono::high_resolution_clock::time_point& t0) {
+    using namespace std::chrono;
+    return duration<double, std::milli>(high_resolution_clock::now() - t0).count();
+}
+
 // ===========================================================================
 // CPU weight caches for the predictor LSTM and joint head
 //
@@ -161,6 +210,29 @@ struct parakeet_vocab {
     std::unordered_map<std::string, int> token_to_id;
 };
 
+struct parakeet_tdt_gpu_state {
+    bool initialised = false;
+    bool ever_used = false;            // false until first GPU decode call
+
+    // Persistent backend tensors that survive across per-step graphs.
+    // Allocated in `state_ctx`, owned by `state_buf`.
+    //
+    // LSTM state (h, c) per layer — written by the predictor graph, read by
+    // both the predictor graph (next step) and the joint graph (h1 == pred_out).
+    ggml_context* state_ctx = nullptr;
+    ggml_backend_buffer_t state_buf = nullptr;
+    ggml_tensor* h0 = nullptr; // [pred_hidden] F32
+    ggml_tensor* c0 = nullptr;
+    ggml_tensor* h1 = nullptr; // pred_out == h1
+    ggml_tensor* c1 = nullptr;
+    // Single F32 [d_model] slot reused per step. The CPU `enc_t` row is
+    // uploaded into this each joint step via ggml_backend_tensor_set.
+    ggml_tensor* enc_t = nullptr;
+    // Single i32 [1] slot for the predictor's input token id (uploaded per
+    // emit step). Lives on backend so embed-row-gather is a backend op.
+    ggml_tensor* tok_id = nullptr;
+};
+
 struct parakeet_context {
     parakeet_context_params params;
 
@@ -177,6 +249,9 @@ struct parakeet_context {
     // Lazy-initialised on first transcribe call.
     parakeet_predictor_weights pred_w;
     parakeet_joint_weights joint_w;
+
+    // GPU TDT decode state (PARAKEET_TDT_GPU=1). Lazy.
+    parakeet_tdt_gpu_state tdt_gpu;
 
     int n_threads = 4;
 
@@ -957,8 +1032,383 @@ struct parakeet_emitted_token {
     float p;     // softmax probability of the emitted token [0, 1]
 };
 
+// ===========================================================================
+// GPU TDT decode (PARAKEET_TDT_GPU=1)
+//
+// The CPU TDT path above is hand-rolled F32 GEMVs and dominates total
+// transcribe time on every clip (60-78% of total at lap-1). On RTX 3060 the
+// per-step work is so small that it's launch-overhead-bound, not flop-bound,
+// so the GPU port is per-emit-step graphs that read/write LSTM state in a
+// persistent backend buffer.
+//
+// Design:
+//  - Persistent state tensors (h0, c0, h1, c1, enc_t, tok_id) live in
+//    `tdt_gpu.state_ctx` / `tdt_gpu.state_buf`, allocated on the same backend
+//    as the model weights. They survive across graph compute calls.
+//  - Predictor graph (run on emit only): reads token id + state, writes
+//    new (h0, c0, h1, c1) via ggml_cpy back into the persistent tensors.
+//  - Joint graph (run every inner step): reads enc_t (uploaded from CPU
+//    per outer-t-step) + h1 (== predictor output, persistent on backend);
+//    writes logits to a graph-output tensor that we tensor_get back to CPU
+//    for argmax / duration / softmax.
+//  - Argmax / sampling / softmax-for-tok_p / dur argmax stay on CPU. They're
+//    sub-ms in lap-1 baseline; moving them buys us nothing.
+//
+// `init_pred_weights` / `init_joint_weights` are no-ops on this path — we go
+// directly to the GGUF-loaded backend tensors. The CPU F32 caches are still
+// initialised so the toggle back to CPU stays available for fallback.
+// ===========================================================================
+
+static void parakeet_tdt_gpu_init(parakeet_context* ctx) {
+    if (ctx->tdt_gpu.initialised)
+        return;
+    auto& s = ctx->tdt_gpu;
+    const int H = (int)ctx->model.hparams.pred_hidden;
+    const int D = (int)ctx->model.hparams.d_model;
+
+    ggml_init_params p = {
+        /*mem_size=*/ggml_tensor_overhead() * 16,
+        /*mem_buffer=*/nullptr,
+        /*no_alloc=*/true,
+    };
+    s.state_ctx = ggml_init(p);
+
+    s.h0 = ggml_new_tensor_1d(s.state_ctx, GGML_TYPE_F32, H);
+    s.c0 = ggml_new_tensor_1d(s.state_ctx, GGML_TYPE_F32, H);
+    s.h1 = ggml_new_tensor_1d(s.state_ctx, GGML_TYPE_F32, H);
+    s.c1 = ggml_new_tensor_1d(s.state_ctx, GGML_TYPE_F32, H);
+    s.enc_t = ggml_new_tensor_1d(s.state_ctx, GGML_TYPE_F32, D);
+    s.tok_id = ggml_new_tensor_1d(s.state_ctx, GGML_TYPE_I32, 1);
+    ggml_set_name(s.h0, "tdt.h0");
+    ggml_set_name(s.c0, "tdt.c0");
+    ggml_set_name(s.h1, "tdt.h1");
+    ggml_set_name(s.c1, "tdt.c1");
+    ggml_set_name(s.enc_t, "tdt.enc_t");
+    ggml_set_name(s.tok_id, "tdt.tok_id");
+
+    s.state_buf = ggml_backend_alloc_ctx_tensors(s.state_ctx, ctx->backend);
+    if (!s.state_buf) {
+        fprintf(stderr, "parakeet: tdt_gpu state alloc failed (backend=%p)\n", (void*)ctx->backend);
+        // Fall through — caller will treat init as failed and use CPU path.
+        ggml_free(s.state_ctx);
+        s.state_ctx = nullptr;
+        return;
+    }
+    s.initialised = true;
+    if (getenv("PARAKEET_DEBUG"))
+        fprintf(stderr, "parakeet: tdt_gpu state init OK (H=%d, D=%d)\n", H, D);
+}
+
+static void parakeet_tdt_gpu_reset_state(parakeet_context* ctx) {
+    auto& s = ctx->tdt_gpu;
+    const int H = (int)ctx->model.hparams.pred_hidden;
+    std::vector<float> zeros(H, 0.0f);
+    ggml_backend_tensor_set(s.h0, zeros.data(), 0, zeros.size() * sizeof(float));
+    ggml_backend_tensor_set(s.c0, zeros.data(), 0, zeros.size() * sizeof(float));
+    ggml_backend_tensor_set(s.h1, zeros.data(), 0, zeros.size() * sizeof(float));
+    ggml_backend_tensor_set(s.c1, zeros.data(), 0, zeros.size() * sizeof(float));
+}
+
+// Build one LSTM layer in-graph. Inputs: x [in_dim] (graph-resident),
+// h_in [H] (persistent), c_in [H] (persistent). Outputs: h_new [H], c_new [H]
+// (both new graph tensors). Caller is responsible for cpy'ing these back to
+// the persistent state tensors.
+//
+// Matches lstm_step_layer (CPU path): gates packed [i, f, g, o], post-act
+// c' = f*c + i*g, h' = o*tanh(c').
+struct lstm_layer_out {
+    ggml_tensor* h_new;
+    ggml_tensor* c_new;
+};
+static lstm_layer_out tdt_gpu_lstm_layer(ggml_context* ctx0, ggml_tensor* x,
+                                         ggml_tensor* w_ih, ggml_tensor* b_ih,
+                                         ggml_tensor* w_hh, ggml_tensor* b_hh,
+                                         ggml_tensor* h_in, ggml_tensor* c_in,
+                                         int H) {
+    // gates_ih = w_ih @ x + b_ih
+    ggml_tensor* gates = ggml_add(ctx0, ggml_mul_mat(ctx0, w_ih, x), b_ih);
+    // gates += w_hh @ h_in + b_hh
+    gates = ggml_add(ctx0, gates, ggml_add(ctx0, ggml_mul_mat(ctx0, w_hh, h_in), b_hh));
+
+    // gates is shape [4H] — split into i, f, g, o slices via views.
+    ggml_tensor* i_g = ggml_view_1d(ctx0, gates, H, 0 * H * sizeof(float));
+    ggml_tensor* f_g = ggml_view_1d(ctx0, gates, H, 1 * H * sizeof(float));
+    ggml_tensor* g_g = ggml_view_1d(ctx0, gates, H, 2 * H * sizeof(float));
+    ggml_tensor* o_g = ggml_view_1d(ctx0, gates, H, 3 * H * sizeof(float));
+
+    i_g = ggml_sigmoid(ctx0, i_g);
+    f_g = ggml_sigmoid(ctx0, f_g);
+    g_g = ggml_tanh(ctx0, g_g);
+    o_g = ggml_sigmoid(ctx0, o_g);
+
+    // c_new = f * c_in + i * g
+    ggml_tensor* c_new = ggml_add(ctx0, ggml_mul(ctx0, f_g, c_in), ggml_mul(ctx0, i_g, g_g));
+    // h_new = o * tanh(c_new)
+    ggml_tensor* h_new = ggml_mul(ctx0, o_g, ggml_tanh(ctx0, c_new));
+
+    return {h_new, c_new};
+}
+
+static ggml_cgraph* parakeet_build_predictor_graph(parakeet_context* ctx) {
+    auto& s = ctx->tdt_gpu;
+    auto& p = ctx->model.predictor;
+    const int H = (int)ctx->model.hparams.pred_hidden;
+
+    ggml_init_params ip = {
+        /*mem_size=*/ctx->compute_meta.size(),
+        /*mem_buffer=*/ctx->compute_meta.data(),
+        /*no_alloc=*/true,
+    };
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 256, false);
+
+    // x = embed_w[tok_id]. embed_w is [H, vocab+1], gather row.
+    ggml_tensor* x_row = ggml_get_rows(ctx0, p.embed_w, s.tok_id);
+    // ggml_get_rows on a 2D tensor returns [H, n_rows]. With n_rows=1 reshape to [H].
+    ggml_tensor* x = ggml_reshape_1d(ctx0, x_row, H);
+
+    // Layer 0: in_dim == H
+    auto l0 = tdt_gpu_lstm_layer(ctx0, x, p.lstm0_w_ih, p.lstm0_b_ih, p.lstm0_w_hh, p.lstm0_b_hh,
+                                 s.h0, s.c0, H);
+    // Layer 1: input is l0.h_new
+    auto l1 = tdt_gpu_lstm_layer(ctx0, l0.h_new, p.lstm1_w_ih, p.lstm1_b_ih, p.lstm1_w_hh, p.lstm1_b_hh,
+                                 s.h1, s.c1, H);
+
+    // Write back: state tensors get the new values via ggml_cpy.
+    ggml_tensor* w_h0 = ggml_cpy(ctx0, l0.h_new, s.h0);
+    ggml_tensor* w_c0 = ggml_cpy(ctx0, l0.c_new, s.c0);
+    ggml_tensor* w_h1 = ggml_cpy(ctx0, l1.h_new, s.h1);
+    ggml_tensor* w_c1 = ggml_cpy(ctx0, l1.c_new, s.c1);
+    ggml_build_forward_expand(gf, w_h0);
+    ggml_build_forward_expand(gf, w_c0);
+    ggml_build_forward_expand(gf, w_h1);
+    ggml_build_forward_expand(gf, w_c1);
+
+    ggml_free(ctx0);
+    return gf;
+}
+
+static ggml_cgraph* parakeet_build_joint_graph(parakeet_context* ctx) {
+    auto& s = ctx->tdt_gpu;
+    auto& j = ctx->model.joint;
+    const int joint_hidden = (int)ctx->model.hparams.joint_hidden;
+    (void)joint_hidden;
+
+    ggml_init_params ip = {
+        /*mem_size=*/ctx->compute_meta.size(),
+        /*mem_buffer=*/ctx->compute_meta.data(),
+        /*no_alloc=*/true,
+    };
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 64, false);
+
+    // joint_in_e = enc_w @ enc_t + enc_b      [joint_hidden]
+    ggml_tensor* je = ggml_add(ctx0, ggml_mul_mat(ctx0, j.enc_w, s.enc_t), j.enc_b);
+    // joint_in_p = pred_w @ pred_out + pred_b   [joint_hidden]   (pred_out == h1)
+    ggml_tensor* jp = ggml_add(ctx0, ggml_mul_mat(ctx0, j.pred_w, s.h1), j.pred_b);
+    // mid = relu(je + jp)
+    ggml_tensor* mid = ggml_relu(ctx0, ggml_add(ctx0, je, jp));
+    // logits = out_w @ mid + out_b              [vocab_total]
+    ggml_tensor* logits = ggml_add(ctx0, ggml_mul_mat(ctx0, j.out_w, mid), j.out_b);
+    ggml_set_name(logits, "tdt.logits");
+    ggml_build_forward_expand(gf, logits);
+
+    ggml_free(ctx0);
+    return gf;
+}
+
+// Run the predictor graph once with `token_id` as the LSTM input.
+// Updates the persistent (h0, c0, h1, c1) tensors in-place.
+static bool tdt_gpu_run_predictor(parakeet_context* ctx, int token_id) {
+    auto& s = ctx->tdt_gpu;
+    int32_t tid = (int32_t)token_id;
+    ggml_backend_tensor_set(s.tok_id, &tid, 0, sizeof(int32_t));
+
+    ggml_cgraph* gf = parakeet_build_predictor_graph(ctx);
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        fprintf(stderr, "parakeet: tdt_gpu predictor alloc failed\n");
+        return false;
+    }
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "parakeet: tdt_gpu predictor compute failed\n");
+        return false;
+    }
+    return true;
+}
+
+// Run the joint graph once with `enc_t_data` as the encoder frame input.
+// Returns logits (size = vocab_total) on the CPU side.
+static bool tdt_gpu_run_joint(parakeet_context* ctx, const float* enc_t_data, int d_model,
+                              std::vector<float>& logits_out) {
+    auto& s = ctx->tdt_gpu;
+    ggml_backend_tensor_set(s.enc_t, enc_t_data, 0, (size_t)d_model * sizeof(float));
+
+    ggml_cgraph* gf = parakeet_build_joint_graph(ctx);
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        fprintf(stderr, "parakeet: tdt_gpu joint alloc failed\n");
+        return false;
+    }
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "parakeet: tdt_gpu joint compute failed\n");
+        return false;
+    }
+    ggml_tensor* logits = ggml_graph_get_tensor(gf, "tdt.logits");
+    if (!logits) {
+        fprintf(stderr, "parakeet: tdt_gpu joint missing logits tensor\n");
+        return false;
+    }
+    const size_t n = ggml_nelements(logits);
+    logits_out.resize(n);
+    ggml_backend_tensor_get(logits, logits_out.data(), 0, n * sizeof(float));
+    return true;
+}
+
+static std::vector<parakeet_emitted_token> parakeet_tdt_decode_gpu(parakeet_context* ctx, const float* enc, int T_enc,
+                                                                   int d_model, parakeet_timing* tim) {
+    using clk = std::chrono::high_resolution_clock;
+    parakeet_tdt_gpu_init(ctx);
+    if (!ctx->tdt_gpu.initialised) {
+        fprintf(stderr, "parakeet: tdt_gpu init failed; falling back to CPU\n");
+        return {};
+    }
+    parakeet_tdt_gpu_reset_state(ctx);
+
+    const auto& hp = ctx->model.hparams;
+    const int blank_id = (int)hp.blank_id;
+    const int n_dur = (int)hp.n_tdt_durations;
+    const int max_per_step = 10;
+
+    // SOS: predictor step on the blank token before any joint call.
+    {
+        auto _t = clk::now();
+        if (!tdt_gpu_run_predictor(ctx, blank_id))
+            return {};
+        if (tim) tim->t_pred_step_ms += ms_since(_t);
+    }
+
+    std::vector<parakeet_emitted_token> emitted;
+    emitted.reserve(256);
+    std::vector<float> logits;
+
+    const bool sampling = ctx->decode_temperature > 0.0f;
+    std::mt19937_64 rng(ctx->decode_seed != 0 ? ctx->decode_seed : (uint64_t)std::random_device{}());
+
+    int t = 0;
+    while (t < T_enc) {
+        if (tim) tim->n_t_steps++;
+        const float* enc_t = enc + (size_t)t * d_model;
+
+        int n_inner = 0;
+        while (n_inner < max_per_step) {
+            // Joint graph: takes enc_t + persistent h1 (== pred_out) → logits.
+            {
+                auto _t = clk::now();
+                if (!tdt_gpu_run_joint(ctx, enc_t, d_model, logits))
+                    return emitted;
+                if (tim) {
+                    tim->t_joint_step_ms += ms_since(_t);
+                    tim->n_inner_steps++;
+                }
+            }
+
+            const int n_vocab_blk = blank_id + 1;
+            if ((int)logits.size() < n_vocab_blk + n_dur) {
+                fprintf(stderr, "parakeet: tdt_gpu logits size %zu < expected %d\n", logits.size(),
+                        n_vocab_blk + n_dur);
+                return emitted;
+            }
+
+            auto _t_argmax = clk::now();
+
+            int tok = 0;
+            float tok_lp = logits[0];
+            for (int v = 1; v < n_vocab_blk; v++) {
+                if (logits[v] > tok_lp) {
+                    tok_lp = logits[v];
+                    tok = v;
+                }
+            }
+            if (sampling) {
+                const float inv_t = 1.0f / ctx->decode_temperature;
+                std::vector<double> pr((size_t)n_vocab_blk);
+                double sum = 0.0;
+                for (int v = 0; v < n_vocab_blk; v++) {
+                    const double e = std::exp((double)((logits[v] - tok_lp) * inv_t));
+                    pr[(size_t)v] = e;
+                    sum += e;
+                }
+                if (sum > 0.0) {
+                    std::uniform_real_distribution<double> unif(0.0, sum);
+                    const double rr = unif(rng);
+                    double acc = 0.0;
+                    for (int v = 0; v < n_vocab_blk; v++) {
+                        acc += pr[(size_t)v];
+                        if (rr <= acc) { tok = v; break; }
+                    }
+                    tok_lp = logits[tok];
+                }
+            }
+
+            int dur_id = 0;
+            float dur_lp = logits[n_vocab_blk];
+            for (int d = 1; d < n_dur; d++) {
+                if (logits[n_vocab_blk + d] > dur_lp) {
+                    dur_lp = logits[n_vocab_blk + d];
+                    dur_id = d;
+                }
+            }
+            int dur_skip = (int)hp.tdt_durations[dur_id];
+
+            if (tok == blank_id) {
+                if (tim) {
+                    tim->t_argmax_softmax_ms += ms_since(_t_argmax);
+                    tim->n_blanks++;
+                }
+                t += std::max(1, dur_skip);
+                break;
+            }
+
+            float tok_p = 1.0f;
+            {
+                double sum = 0.0;
+                for (int v = 0; v < n_vocab_blk; v++)
+                    sum += std::exp((double)(logits[v] - tok_lp));
+                tok_p = sum > 0.0 ? (float)(1.0 / sum) : 0.0f;
+            }
+            if (tim) tim->t_argmax_softmax_ms += ms_since(_t_argmax);
+
+            int t_end = std::min(T_enc, t + std::max(0, dur_skip));
+            emitted.push_back({tok, t, t_end, tok_p});
+            {
+                auto _t = clk::now();
+                if (!tdt_gpu_run_predictor(ctx, tok))
+                    return emitted;
+                if (tim) {
+                    tim->t_pred_step_ms += ms_since(_t);
+                    tim->n_emits++;
+                }
+            }
+
+            if (dur_skip > 0) {
+                t += dur_skip;
+                break;
+            }
+            n_inner++;
+        }
+
+        if (n_inner >= max_per_step)
+            t++;
+    }
+
+    ctx->tdt_gpu.ever_used = true;
+    return emitted;
+}
+
 static std::vector<parakeet_emitted_token> parakeet_tdt_decode(parakeet_context* ctx, const float* enc, int T_enc,
-                                                               int d_model) {
+                                                               int d_model, parakeet_timing* tim = nullptr) {
+    using clk = std::chrono::high_resolution_clock;
     parakeet_init_pred_weights(ctx);
     parakeet_init_joint_weights(ctx);
 
@@ -983,7 +1433,11 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode(parakeet_context*
 
     // SOS / first input is the blank token (NeMo convention)
     std::vector<float> pred_out;
-    predictor_step(W, blank_id, state, pred_out);
+    {
+        auto _t = clk::now();
+        predictor_step(W, blank_id, state, pred_out);
+        if (tim) tim->t_pred_step_ms += ms_since(_t);
+    }
     if (getenv("PARAKEET_DEBUG"))
         fprintf(
             stderr, "parakeet: pred_out[blank]: mean=%.4f std=%.4f [0..3]=%.4f %.4f %.4f %.4f\n",
@@ -1017,11 +1471,23 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode(parakeet_context*
     int t = 0;
     int total_steps = 0;
     while (t < T_enc) {
-        joint_proj_enc(J, enc + (size_t)t * d_model, proj_e);
+        if (tim) tim->n_t_steps++;
+        {
+            auto _t = clk::now();
+            joint_proj_enc(J, enc + (size_t)t * d_model, proj_e);
+            if (tim) tim->t_joint_proj_enc_ms += ms_since(_t);
+        }
 
         int n_inner = 0;
         while (n_inner < max_per_step) {
-            joint_step(J, proj_e.data(), pred_out.data(), logits);
+            {
+                auto _t = clk::now();
+                joint_step(J, proj_e.data(), pred_out.data(), logits);
+                if (tim) {
+                    tim->t_joint_step_ms += ms_since(_t);
+                    tim->n_inner_steps++;
+                }
+            }
 
             if (getenv("PARAKEET_DEBUG") && total_steps < 5) {
                 // Show first few logits
@@ -1036,6 +1502,8 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode(parakeet_context*
                         best_v, logits[blank_id]);
             }
             total_steps++;
+
+            auto _t_argmax = clk::now();
 
             // Argmax (default) or temperature sample over the vocab+blank
             // logits. The duration logits are picked separately by argmax
@@ -1089,6 +1557,10 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode(parakeet_context*
 
             if (tok == blank_id) {
                 // Blank → never emit, always advance t by at least 1 frame.
+                if (tim) {
+                    tim->t_argmax_softmax_ms += ms_since(_t_argmax);
+                    tim->n_blanks++;
+                }
                 t += std::max(1, dur_skip);
                 break;
             }
@@ -1105,11 +1577,19 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode(parakeet_context*
                 }
                 tok_p = sum > 0.0 ? (float)(1.0 / sum) : 0.0f;
             }
+            if (tim) tim->t_argmax_softmax_ms += ms_since(_t_argmax);
 
             // Real token: emit and advance the predictor
             int t_end = std::min(T_enc, t + std::max(0, dur_skip));
             emitted.push_back({tok, t, t_end, tok_p});
-            predictor_step(W, tok, state, pred_out);
+            {
+                auto _t = clk::now();
+                predictor_step(W, tok, state, pred_out);
+                if (tim) {
+                    tim->t_pred_step_ms += ms_since(_t);
+                    tim->n_emits++;
+                }
+            }
 
             // Diagnostic: dump predictor stats for the first few emissions
             // so we can compare with NeMo step-by-step (not just SOS).
@@ -1201,6 +1681,10 @@ extern "C" struct parakeet_context* parakeet_init_from_file(const char* path_mod
 extern "C" void parakeet_free(struct parakeet_context* ctx) {
     if (!ctx)
         return;
+    if (ctx->tdt_gpu.state_buf)
+        ggml_backend_buffer_free(ctx->tdt_gpu.state_buf);
+    if (ctx->tdt_gpu.state_ctx)
+        ggml_free(ctx->tdt_gpu.state_ctx);
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->model.buf)
@@ -1502,9 +1986,16 @@ extern "C" struct parakeet_result* parakeet_transcribe_ex(struct parakeet_contex
     if (!ctx || !samples || n_samples <= 0)
         return nullptr;
 
+    using clk = std::chrono::high_resolution_clock;
+    parakeet_timing tim_local;
+    tim_local.on = parakeet_timing_enabled();
+    parakeet_timing* tim = tim_local.on ? &tim_local : nullptr;
+
     // 1. Mel
     int T_mel = 0;
+    auto _t_mel = clk::now();
     auto mel = parakeet_compute_mel_impl(ctx, samples, n_samples, T_mel);
+    if (tim) tim->t_mel_ms = ms_since(_t_mel);
     if (mel.empty())
         return nullptr;
     if (getenv("PARAKEET_DEBUG"))
@@ -1512,7 +2003,12 @@ extern "C" struct parakeet_result* parakeet_transcribe_ex(struct parakeet_contex
 
     // 2. Encoder
     int T_enc = 0;
+    auto _t_enc = clk::now();
     auto enc = parakeet_encode_mel(ctx, mel.data(), (int)ctx->model.hparams.n_mels, T_mel, &T_enc);
+    if (tim) {
+        tim->t_encoder_ms = ms_since(_t_enc);
+        tim->T_enc = T_enc;
+    }
     if (enc.empty())
         return nullptr;
     if (getenv("PARAKEET_DEBUG")) {
@@ -1528,10 +2024,47 @@ extern "C" struct parakeet_result* parakeet_transcribe_ex(struct parakeet_contex
                 (double)enc[1], (double)enc[2], (double)enc[3]);
     }
 
-    // 3. TDT greedy decode
-    auto emitted = parakeet_tdt_decode(ctx, enc.data(), T_enc, (int)ctx->model.hparams.d_model);
+    // 3. TDT greedy decode. GPU path is the default after the lap-2 win
+    // (5× speedup, WER drift unchanged, GPU util 1%→78%). Set
+    // PARAKEET_TDT_GPU=0 to fall back to the CPU path (scalar F32 LSTM +
+    // hand-rolled GEMVs) for debugging.
+    auto _t_dec = clk::now();
+    static int tdt_gpu_cached = -1;
+    if (tdt_gpu_cached < 0) {
+        const char* e = getenv("PARAKEET_TDT_GPU");
+        // default on; "0" / "false" disable. Empty / unset → on.
+        if (e && *e && (strcmp(e, "0") == 0 || strcmp(e, "false") == 0))
+            tdt_gpu_cached = 0;
+        else
+            tdt_gpu_cached = 1;
+    }
+    std::vector<parakeet_emitted_token> emitted;
+    if (tdt_gpu_cached) {
+        emitted = parakeet_tdt_decode_gpu(ctx, enc.data(), T_enc, (int)ctx->model.hparams.d_model, tim);
+        if (emitted.empty() && T_enc > 0 && !ctx->tdt_gpu.ever_used) {
+            // GPU path failed init (e.g. CPU-only build): fall back to CPU.
+            emitted = parakeet_tdt_decode(ctx, enc.data(), T_enc, (int)ctx->model.hparams.d_model, tim);
+        }
+    } else {
+        emitted = parakeet_tdt_decode(ctx, enc.data(), T_enc, (int)ctx->model.hparams.d_model, tim);
+    }
+    if (tim) tim->t_decode_ms = ms_since(_t_dec);
     if (getenv("PARAKEET_DEBUG"))
         fprintf(stderr, "parakeet: decode OK (%d tokens)\n", (int)emitted.size());
+
+    if (tim) {
+        const double total = tim->t_mel_ms + tim->t_encoder_ms + tim->t_decode_ms;
+        const double clip_ms = (double)n_samples * 1000.0 / 16000.0;
+        const double rtf = clip_ms / std::max(1e-6, total);
+        // Stages — one summary line. Audio length / RTF / mel / encoder / decode (and inside decode).
+        fprintf(stderr,
+                "parakeet[timing] clip=%.1fs RTF=%.2fx total=%.1fms | mel=%.1f enc=%.1f(T=%d) "
+                "dec=%.1f { pred=%.1f(emits=%d) j_proj=%.1f(t=%d) j_step=%.1f(inner=%d) "
+                "argmax=%.1f blanks=%d }\n",
+                clip_ms / 1000.0, rtf, total, tim->t_mel_ms, tim->t_encoder_ms, tim->T_enc, tim->t_decode_ms,
+                tim->t_pred_step_ms, tim->n_emits, tim->t_joint_proj_enc_ms, tim->n_t_steps, tim->t_joint_step_ms,
+                tim->n_inner_steps, tim->t_argmax_softmax_ms, tim->n_blanks);
+    }
 
     // 4. Build result
     auto* r = (parakeet_result*)calloc(1, sizeof(parakeet_result));
