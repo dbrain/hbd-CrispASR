@@ -283,6 +283,13 @@ struct parakeet_context {
     // GPU mel STFT state (PARAKEET_MEL_GPU=1, default on). Lazy.
     parakeet_mel_gpu_state mel_gpu;
 
+    // Lap-4 lever B3: dedicated gallocr for the encoder graph. Bypasses
+    // ggml_backend_sched so the CUDA backend captures one CUDA graph for the
+    // entire encoder per stable shape, rather than per-sched-split. Allocated
+    // lazily on first encoder call when PARAKEET_ENC_CACHE != 0. Releases via
+    // ggml_gallocr_free in parakeet_free.
+    ggml_gallocr_t enc_gallocr = nullptr;
+
     int n_threads = 4;
 
     // Decode-time sampling controls. Default temperature == 0 keeps the
@@ -950,8 +957,18 @@ static ggml_cgraph* parakeet_build_graph_encoder(parakeet_context* ctx, int T_me
     ggml_set_input(pos_enc);
 
     // ----- 24× FastConformer block -----
+    // Lap-4 lever B1: PARAKEET_FA=1 routes self-attn through ggml_flash_attn_ext
+    // with the rel-pos BD term passed as a per-head F16 mask. n_heads is moved
+    // to ne[3] so the CUDA kernel's mask->ne[2]==1 constraint is satisfied
+    // (per fattn.cu:423). Default OFF until parity is verified end-to-end.
+    static int fa_cached = -1;
+    if (fa_cached < 0) {
+        const char* e = getenv("PARAKEET_FA");
+        fa_cached = (e && *e && strcmp(e, "0") != 0 && strcmp(e, "false") != 0) ? 1 : 0;
+    }
     core_conformer::BlockParams bp = {
         (int)hp.d_model, (int)hp.n_heads, (int)hp.head_dim, (int)hp.conv_kernel, kLayerNormEps,
+        /*use_fa=*/(fa_cached != 0),
     };
     for (uint32_t il = 0; il < hp.n_layers; il++) {
         cur = core_conformer::build_block(ctx0, cur, pos_enc, T, m.enc[il], bp);
@@ -968,6 +985,12 @@ static ggml_cgraph* parakeet_build_graph_encoder(parakeet_context* ctx, int T_me
 // Run the encoder once. Returns enc_out as a flat row-major [T_enc, d_model].
 // Caller computes T_enc as ceil(T_mel / subsampling_factor) (approximately —
 // the actual value depends on the conv arithmetic and is reported back).
+//
+// Lap-4 lever B3: PARAKEET_ENC_CACHE=1 swaps ggml_backend_sched for a
+// dedicated ggml_gallocr_t + direct ggml_backend_graph_compute. Lets the CUDA
+// backend capture one CUDA graph for the whole encoder per stable shape
+// instead of per-sched-split (24+ warmups previously). The gallocr re-uses
+// its backend buffer pool when shapes match across calls. Default OFF.
 static std::vector<float> parakeet_encode_mel(parakeet_context* ctx, const float* mel, int n_mels, int T_mel,
                                               int* out_T_enc) {
     if (n_mels != (int)ctx->model.hparams.n_mels) {
@@ -975,21 +998,52 @@ static std::vector<float> parakeet_encode_mel(parakeet_context* ctx, const float
         return {};
     }
 
-    if (!ctx->sched) {
-        ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
-        int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
-        ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 8192, false, false);
+    static int enc_cache_cached = -1;
+    if (enc_cache_cached < 0) {
+        const char* e = getenv("PARAKEET_ENC_CACHE");
+        enc_cache_cached = (e && *e && strcmp(e, "0") != 0 && strcmp(e, "false") != 0) ? 1 : 0;
     }
+
     if (ctx->compute_meta.empty()) {
         ctx->compute_meta.resize(ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false));
     }
 
+    if (!enc_cache_cached) {
+        // ---- Legacy sched path ----
+        if (!ctx->sched) {
+            ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
+            int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
+            ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 8192, false, false);
+        }
+    } else {
+        // ---- Dedicated gallocr path (lap-4 lever B3) ----
+        if (!ctx->enc_gallocr) {
+            ctx->enc_gallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+            if (!ctx->enc_gallocr) {
+                fprintf(stderr, "parakeet: enc_gallocr_new failed; falling back to sched\n");
+                enc_cache_cached = 0;
+                if (!ctx->sched) {
+                    ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
+                    int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
+                    ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 8192, false, false);
+                }
+            }
+        }
+    }
+
     ggml_cgraph* gf = parakeet_build_graph_encoder(ctx, T_mel);
 
-    ggml_backend_sched_reset(ctx->sched);
-    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
-        fprintf(stderr, "parakeet: failed to alloc encoder graph\n");
-        return {};
+    if (enc_cache_cached) {
+        if (!ggml_gallocr_alloc_graph(ctx->enc_gallocr, gf)) {
+            fprintf(stderr, "parakeet: enc_gallocr alloc failed\n");
+            return {};
+        }
+    } else {
+        ggml_backend_sched_reset(ctx->sched);
+        if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+            fprintf(stderr, "parakeet: failed to alloc encoder graph\n");
+            return {};
+        }
     }
 
     // Set inputs
@@ -1003,8 +1057,12 @@ static std::vector<float> parakeet_encode_mel(parakeet_context* ctx, const float
     ggml_backend_tensor_set(pos_in, pe.data(), 0, pe.size() * sizeof(float));
 
     // Compute
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "parakeet: encoder graph compute failed\n");
+    ggml_status st = enc_cache_cached
+        ? ggml_backend_graph_compute(ctx->backend, gf)
+        : ggml_backend_sched_graph_compute(ctx->sched, gf);
+    if (st != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "parakeet: encoder graph compute failed (path=%s)\n",
+                enc_cache_cached ? "gallocr" : "sched");
         return {};
     }
 
@@ -1968,6 +2026,8 @@ extern "C" void parakeet_free(struct parakeet_context* ctx) {
         ggml_backend_buffer_free(ctx->mel_gpu.state_buf);
     if (ctx->mel_gpu.state_ctx)
         ggml_free(ctx->mel_gpu.state_ctx);
+    if (ctx->enc_gallocr)
+        ggml_gallocr_free(ctx->enc_gallocr);
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->model.buf)
