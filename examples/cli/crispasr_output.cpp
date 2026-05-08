@@ -4,10 +4,12 @@
 
 #include "crispasr_output.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <sstream>
 
@@ -850,6 +852,161 @@ std::string crispasr_segments_to_openai_verbose_json(const std::vector<crispasr_
     }
     js << "  ]\n";
     js << "}\n";
+    return js.str();
+}
+
+// Read-along-friendly segment grouping when the backend emits one giant
+// segment per chunk (parakeet). Groups words at sentence-final punctuation
+// or whenever the running window would exceed max_dur_cs / max_words. Mirrors
+// the Python parakeet-stt server's _build_segments() so the kobbler reader
+// gets the same highlight granularity it had before the C++ port.
+namespace {
+
+constexpr int kSegMaxDurCs = 800; // 8.0s
+constexpr int kSegMaxWords = 18;
+
+bool ends_sentence(const std::string& w) {
+    if (w.empty())
+        return false;
+    // Strip trailing whitespace before checking.
+    size_t i = w.size();
+    while (i > 0 && (w[i - 1] == ' ' || w[i - 1] == '\t' || w[i - 1] == '\n' || w[i - 1] == '\r'))
+        i--;
+    if (i == 0)
+        return false;
+    const char c = w[i - 1];
+    return c == '.' || c == '!' || c == '?';
+}
+
+struct kobbler_segment {
+    int64_t t0 = 0;
+    int64_t t1 = 0;
+    std::string text;
+};
+
+std::vector<kobbler_segment> rebuild_segments_from_words(const std::vector<crispasr_word>& words) {
+    std::vector<kobbler_segment> out;
+    if (words.empty())
+        return out;
+    kobbler_segment cur;
+    bool open = false;
+    std::string buf;
+    for (const auto& w : words) {
+        if (w.text.empty())
+            continue;
+        if (!open) {
+            cur.t0 = w.t0;
+            buf.clear();
+            open = true;
+        }
+        if (!buf.empty())
+            buf += ' ';
+        buf += w.text;
+        cur.t1 = w.t1;
+        const bool too_long =
+            ((cur.t1 - cur.t0) >= kSegMaxDurCs) || ((int)std::count(buf.begin(), buf.end(), ' ') + 1 >= kSegMaxWords);
+        if (ends_sentence(w.text) || too_long) {
+            cur.text = buf;
+            out.push_back(cur);
+            open = false;
+        }
+    }
+    if (open) {
+        cur.text = buf;
+        out.push_back(cur);
+    }
+    return out;
+}
+
+void emit_item(std::ostringstream& js, double start_s, double end_s, const std::string& text, int id, bool with_id) {
+    js << "{\"start\": " << start_s << ", \"end\": " << end_s << ", \"text\": \"" << json_escape(text) << "\"";
+    if (with_id)
+        js << ", \"id\": " << id;
+    js << "}";
+}
+
+} // namespace
+
+std::string crispasr_segments_to_kobbler_json(const std::vector<crispasr_segment>& segs,
+                                              const std::string& granularity, const std::string& language,
+                                              bool preempted) {
+    // Aggregate words across all chunks (each backend->transcribe() call returns
+    // one or more crispasr_segments; for parakeet it's one per chunk with words
+    // attached). Tokens are kept for the primary granularity=="char" path even
+    // though parakeet's tokens are sub-words rather than chars — koblem's
+    // chars list will simply be empty in that case (current behavior).
+    std::vector<crispasr_word> all_words;
+    std::vector<crispasr_token> all_tokens; // sub-word for parakeet — used only if granularity=="char"
+    for (const auto& s : segs) {
+        all_words.insert(all_words.end(), s.words.begin(), s.words.end());
+        all_tokens.insert(all_tokens.end(), s.tokens.begin(), s.tokens.end());
+    }
+
+    auto rebuilt = rebuild_segments_from_words(all_words);
+
+    // Full text: concatenate the rebuilt segments (matches what koblem
+    // displays). Falls back to native segment text if no words were available.
+    std::string full_text;
+    if (!rebuilt.empty()) {
+        for (size_t i = 0; i < rebuilt.size(); i++) {
+            if (i)
+                full_text += ' ';
+            full_text += rebuilt[i].text;
+        }
+    } else {
+        full_text = crispasr_segments_to_text(segs);
+    }
+
+    std::ostringstream js;
+    js << std::fixed << std::setprecision(2);
+    js << "{";
+    js << "\"text\": \"" << json_escape(full_text) << "\"";
+
+    auto write_array = [&](const std::string& key, std::function<void(std::ostringstream&)> body) {
+        js << ", \"" << key << "\": [";
+        body(js);
+        js << "]";
+    };
+
+    // Decide which list is "segments" (primary read-along granularity).
+    std::string g = granularity.empty() ? "segment" : granularity;
+    if (g != "segment" && g != "word" && g != "char")
+        g = "segment";
+
+    auto emit_segments = [&](std::ostringstream& o) {
+        for (size_t i = 0; i < rebuilt.size(); i++) {
+            if (i)
+                o << ", ";
+            emit_item(o, rebuilt[i].t0 / 100.0, rebuilt[i].t1 / 100.0, rebuilt[i].text, (int)i, /*with_id=*/true);
+        }
+    };
+    auto emit_words = [&](std::ostringstream& o) {
+        for (size_t i = 0; i < all_words.size(); i++) {
+            if (i)
+                o << ", ";
+            emit_item(o, all_words[i].t0 / 100.0, all_words[i].t1 / 100.0, all_words[i].text, 0, /*with_id=*/false);
+        }
+    };
+    auto emit_chars = [&](std::ostringstream& o) {
+        // Backends that don't expose char timing leave this empty.
+        // Parakeet emits tokens (sub-words) — exposing them under "chars"
+        // would mislead koblem's reader, so we deliberately keep [] here.
+        (void)o;
+    };
+
+    if (g == "word") {
+        write_array("segments", emit_words);
+    } else if (g == "char") {
+        write_array("segments", emit_chars);
+    } else {
+        write_array("segments", emit_segments);
+    }
+    write_array("words", emit_words);
+    write_array("chars", emit_chars);
+
+    js << ", \"language\": \"" << json_escape(language) << "\"";
+    js << ", \"preempted\": " << (preempted ? "true" : "false");
+    js << "}";
     return js.str();
 }
 

@@ -36,6 +36,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -46,6 +47,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifdef _WIN32
@@ -223,35 +225,65 @@ struct transcription_result {
     std::string language;
     double duration_s = 0.0;
     double elapsed_s = 0.0;
+    bool preempted = false; // true if cancel_url signalled mid-transcription
 };
 
-// Load audio from a multipart file upload, transcribe it, return result.
-// Acquires model_mutex internally.
-static transcription_result do_transcribe(const httplib::MultipartFormData& audio_file, CrispasrBackend* backend,
-                                          std::mutex& model_mutex, whisper_params rp) {
+// Poll an external cancel URL between chunks; treats unreachable / malformed
+// URL as "not cancelled" so a flaky signal endpoint can never block STT.
+// koblem signals between-chunk preemption when a higher-priority service
+// (TTS/vision) needs the GPU — see api/src/stt.rs::apply_params().
+static bool check_cancel(const std::string& cancel_url) {
+    if (cancel_url.empty())
+        return false;
+    // Parse "http(s)://host:port/path" — httplib::Client wants scheme+host
+    // separately from path. Cheap manual split (no URL escaping inside path
+    // expected from koblem's signed-token format).
+    auto scheme_end = cancel_url.find("://");
+    if (scheme_end == std::string::npos)
+        return false;
+    auto host_start = scheme_end + 3;
+    auto path_start = cancel_url.find('/', host_start);
+    std::string host = (path_start == std::string::npos) ? cancel_url.substr(0, std::string::npos)
+                                                         : cancel_url.substr(0, path_start);
+    std::string path = (path_start == std::string::npos) ? "/" : cancel_url.substr(path_start);
+    httplib::Client cli(host);
+    cli.set_connection_timeout(2);
+    cli.set_read_timeout(2);
+    auto r = cli.Get(path);
+    if (!r || r->status != 200)
+        return false;
+    try {
+        auto body = nlohmann::json::parse(r->body);
+        return body.value("cancelled", false);
+    } catch (...) {
+        return false;
+    }
+}
+
+// Decode audio from a path on disk and transcribe it. Caller is responsible
+// for placing audio at `audio_path` (either a real file_path or a temp file
+// written from a multipart upload). Acquires model_mutex internally.
+//
+// Between chunks the loop polls cancel_url; on a cancel signal it sets
+// preempted=true and returns whatever has transcribed so far. Useful when
+// a higher-priority GPU consumer (TTS, vision) preempts the STT job and we
+// don't want to discard partial work.
+static transcription_result do_transcribe(const std::string& audio_path, CrispasrBackend* backend,
+                                          std::mutex& model_mutex, const whisper_params& rp,
+                                          const std::string& cancel_url) {
     transcription_result result;
     result.language = rp.language;
 
     if (rp.verbose)
-        fprintf(stderr, "crispasr-server: processing '%s' (%zu bytes)\n", audio_file.filename.c_str(),
-                audio_file.content.size());
+        fprintf(stderr, "crispasr-server: processing '%s'\n", audio_path.c_str());
 
-    // Write to a secure temporary file for audio decoding.
-    std::string tmp_path = write_temp_audio(audio_file.content.data(), audio_file.content.size());
-    if (tmp_path.empty()) {
-        result.error = "failed to create temporary file for audio";
-        return result;
-    }
-
-    // Decode audio.
+    // Decode audio directly from the provided path.
     std::vector<float> pcmf32;
     std::vector<std::vector<float>> pcmf32s;
-    if (!read_audio_data(tmp_path, pcmf32, pcmf32s, rp.diarize)) {
-        std::remove(tmp_path.c_str());
+    if (!read_audio_data(audio_path, pcmf32, pcmf32s, rp.diarize)) {
         result.error = "failed to decode audio (unsupported format or corrupt file)";
         return result;
     }
-    std::remove(tmp_path.c_str());
 
     if (pcmf32.empty()) {
         result.error = "audio file contains no samples";
@@ -303,15 +335,25 @@ static transcription_result do_transcribe(const httplib::MultipartFormData& audi
         result.language = rp.language;
 
         if (n_samples <= max_chunk_samples) {
-            // Short audio — single pass
+            // Short audio — single pass; no cancel checkpoint mid-chunk
+            // (the encoder owns the GPU for the duration of one transcribe
+            // call and there's no cooperative preemption inside it).
             result.segs = backend->transcribe(pcmf32.data(), n_samples, 0, rp);
         } else {
-            // Chunk long audio into fixed segments
+            // Chunk long audio into fixed segments. Between chunks we yield
+            // control long enough to poll cancel_url; if koblem signals
+            // preemption we keep the partial transcript and bail.
             int n_chunks = (n_samples + max_chunk_samples - 1) / max_chunk_samples;
             fprintf(stderr, "crispasr-server: chunking %.1fs audio into %d × %ds segments\n", result.duration_s,
                     n_chunks, rp.chunk_seconds);
             int chunk_idx = 0;
             for (int offset = 0; offset < n_samples; offset += max_chunk_samples) {
+                if (check_cancel(cancel_url)) {
+                    fprintf(stderr, "crispasr-server: cancel_url signalled preemption at chunk %d/%d\n", chunk_idx,
+                            n_chunks);
+                    result.preempted = true;
+                    break;
+                }
                 int chunk_len = std::min(max_chunk_samples, n_samples - offset);
                 int64_t t_offset_cs = (int64_t)((double)offset / SR * 100.0);
                 auto tc0 = std::chrono::steady_clock::now();
@@ -352,45 +394,133 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     std::unique_ptr<CrispasrBackend> backend;
     std::mutex model_mutex;
     std::atomic<bool> ready{false};
+    // model_loaded distinguishes "we have a backend instance holding GPU
+    // memory" from ready (which goes false during /load swaps as well).
+    // /unload sets both to false; lazy-load enters service with both false.
+    std::atomic<bool> model_loaded{false};
+    std::atomic<int64_t> last_request_ms{0};
     std::string backend_name = params.backend;
 
-    // Initial model load
-    {
-        const bool model_is_auto = params.model == "auto" || params.model == "default";
-        if (backend_name.empty() || backend_name == "auto") {
+    // Ecosystem env knobs — keep load semantics matching the python parakeet-stt
+    // service (kobbler/docker/parakeet-stt/) so koblem's GPU gate sees the same
+    // load/idle behavior on either backend.
+    const bool lazy_load = []() {
+        const char* v = getenv("PARAKEET_LAZY_LOAD");
+        if (!v)
+            return false;
+        std::string s = v;
+        return s == "1" || s == "true" || s == "TRUE" || s == "yes" || s == "YES";
+    }();
+    const int idle_unload_seconds = []() {
+        const char* v = getenv("PARAKEET_IDLE_UNLOAD_SECONDS");
+        if (!v || !*v)
+            return 300;
+        try {
+            return std::stoi(v);
+        } catch (...) {
+            return 300;
+        }
+    }();
+
+    // Resolve the model + backend name without committing GPU memory.
+    // Splitting resolve from init lets lazy mode advertise the model via
+    // /v1/models even when nothing is loaded yet.
+    auto resolve_model_into_params = [&](whisper_params& p, std::string& out_backend_name) -> bool {
+        const bool model_is_auto = p.model == "auto" || p.model == "default";
+        if (out_backend_name.empty() || out_backend_name == "auto") {
             if (model_is_auto) {
-                backend_name = "whisper";
-                if (!params.no_prints) {
+                out_backend_name = "whisper";
+                if (!p.no_prints)
                     fprintf(stderr, "crispasr-server: -m auto with no backend — defaulting to whisper\n");
-                }
             } else {
-                backend_name = crispasr_detect_backend_from_gguf(params.model);
+                out_backend_name = crispasr_detect_backend_from_gguf(p.model);
             }
         }
-        if (backend_name.empty()) {
-            fprintf(stderr, "crispasr-server: cannot detect backend from '%s'\n", params.model.c_str());
-            return 1;
+        if (out_backend_name.empty()) {
+            fprintf(stderr, "crispasr-server: cannot detect backend from '%s'\n", p.model.c_str());
+            return false;
         }
-
-        const std::string resolved =
-            crispasr_resolve_model_cli(params.model, backend_name, params.no_prints, params.cache_dir,
-                                       params.auto_download || model_is_auto, params.model_quant);
+        const std::string resolved = crispasr_resolve_model_cli(p.model, out_backend_name, p.no_prints, p.cache_dir,
+                                                                p.auto_download || model_is_auto, p.model_quant);
         if (resolved.empty()) {
-            fprintf(stderr, "crispasr-server: failed to resolve model '%s' for backend '%s'\n", params.model.c_str(),
-                    backend_name.c_str());
-            return 1;
+            fprintf(stderr, "crispasr-server: failed to resolve model '%s' for backend '%s'\n", p.model.c_str(),
+                    out_backend_name.c_str());
+            return false;
         }
-        params.model = resolved;
+        p.model = resolved;
+        return true;
+    };
 
-        backend = crispasr_create_backend(backend_name);
-        if (!backend || !backend->init(params)) {
+    // Materialize the backend (allocates GPU memory). Caller holds model_mutex.
+    // Builds a fresh backend before dropping any existing one so a failed
+    // load on hot-swap leaves the prior model in place. The `ready` flag
+    // is only flipped during the brief window where backend is being
+    // assigned; new requests block on model_mutex through that window.
+    auto load_backend_locked = [&]() -> bool {
+        auto nb = crispasr_create_backend(backend_name);
+        if (!nb || !nb->init(params)) {
             fprintf(stderr, "crispasr-server: failed to init backend '%s'\n", backend_name.c_str());
-            return 1;
+            return false;
         }
+        ready.store(false);
+        backend = std::move(nb); // dtor of previous backend frees prior GPU memory
+        model_loaded.store(true);
         ready.store(true);
         fprintf(stderr, "crispasr-server: backend '%s' loaded, model '%s'\n", backend_name.c_str(),
                 params.model.c_str());
+        return true;
+    };
+
+    // Tear down the backend and free GPU memory. Caller holds model_mutex.
+    // CrispasrBackend's dtor calls shutdown() which calls parakeet_free()
+    // (or the backend equivalent), which releases CUDA allocations. We
+    // verify in the baseline harness that this returns nvidia-smi to the
+    // pre-load floor; if it doesn't, we'll switch to subprocess isolation
+    // like the python service does.
+    auto free_backend_locked = [&]() {
+        ready.store(false);
+        backend.reset();
+        model_loaded.store(false);
+        fprintf(stderr, "crispasr-server: backend unloaded\n");
+    };
+
+    if (!resolve_model_into_params(params, backend_name))
+        return 1;
+
+    if (lazy_load) {
+        fprintf(stderr, "crispasr-server: PARAKEET_LAZY_LOAD=1 — deferring model load until first request\n");
+    } else {
+        std::lock_guard<std::mutex> lock(model_mutex);
+        if (!load_backend_locked())
+            return 1;
     }
+
+    auto touch_last_request = [&]() {
+        last_request_ms.store(
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+    };
+
+    // Ensure backend is loaded (lazy path). Returns true if ready to serve.
+    // Sets a 503 on `res` and returns false on failure so callers can early-out.
+    auto ensure_loaded = [&](Response& res) -> bool {
+        if (model_loaded.load() && ready.load())
+            return true;
+        if (!lazy_load) {
+            // Non-lazy server: model is genuinely still loading or failed.
+            json_error(res, 503, "model is still loading");
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(model_mutex);
+        // Re-check under lock — another request may have loaded it.
+        if (model_loaded.load() && ready.load())
+            return true;
+        if (!load_backend_locked()) {
+            json_error(res, 503, "failed to load model");
+            return false;
+        }
+        return true;
+    };
 
     Server svr;
 
@@ -430,76 +560,130 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     svr.Post("/inference", [&](const Request& req, Response& res) {
         if (!require_auth(req, res))
             return;
-        if (!ready.load()) {
-            json_error(res, 503, "model loading");
+        touch_last_request();
+        if (!ensure_loaded(res))
             return;
-        }
-        if (!req.has_file("file")) {
-            json_error(res, 400, "no 'file' field in multipart upload");
-            return;
-        }
 
-        auto audio_file = req.get_file_value("file");
-        fprintf(stderr, "crispasr-server: /inference received '%s' (%zu bytes)\n", audio_file.filename.c_str(),
-                audio_file.content.size());
+        // Audio source: either multipart upload (`file`) or server-side path
+        // (`file_path`, kobbler-style — koblem mounts kobbler media into the
+        // container and passes the path to skip multi-GB multipart uploads).
+        std::string audio_path;
+        bool tmp_owned = false;
+        const std::string file_path = form_string(req, "file_path");
+        if (!file_path.empty()) {
+            audio_path = file_path;
+        } else if (req.has_file("file")) {
+            auto audio_file = req.get_file_value("file");
+            fprintf(stderr, "crispasr-server: /inference received '%s' (%zu bytes)\n", audio_file.filename.c_str(),
+                    audio_file.content.size());
+            audio_path = write_temp_audio(audio_file.content.data(), audio_file.content.size());
+            if (audio_path.empty()) {
+                json_error(res, 500, "failed to create temporary file for audio");
+                return;
+            }
+            tmp_owned = true;
+        } else {
+            json_error(res, 400, "missing audio: provide multipart 'file' or form 'file_path'");
+            return;
+        }
 
         // Per-request parameter overrides.
         whisper_params rp = params;
         rp.language = form_string(req, "language", rp.language);
 
-        auto result = do_transcribe(audio_file, backend.get(), model_mutex, rp);
+        const std::string cancel_url = form_string(req, "cancel_url");
+        auto result = do_transcribe(audio_path, backend.get(), model_mutex, rp, cancel_url);
+        if (tmp_owned)
+            std::remove(audio_path.c_str());
+
         if (!result.ok) {
             json_error(res, 400, result.error);
             return;
         }
 
-        fprintf(stderr, "crispasr-server: transcribed %.1fs audio in %.2fs (%.1fx realtime)\n", result.duration_s,
-                result.elapsed_s, result.elapsed_s > 0 ? result.duration_s / result.elapsed_s : 0.0);
+        fprintf(stderr, "crispasr-server: transcribed %.1fs audio in %.2fs (%.1fx realtime)%s\n", result.duration_s,
+                result.elapsed_s, result.elapsed_s > 0 ? result.duration_s / result.elapsed_s : 0.0,
+                result.preempted ? " [preempted]" : "");
 
         std::string json = crispasr_segments_to_native_json(result.segs, backend_name, result.duration_s);
         res.set_content(json, "application/json");
+        touch_last_request();
     });
 
     // -----------------------------------------------------------------------
     // POST /v1/audio/transcriptions — OpenAI-compatible endpoint
     //
-    // Accepts the same multipart fields as the OpenAI API:
-    //   file             (required) — audio file
-    //   model            (optional) — ignored (we use the loaded model)
-    //   language         (optional) — ISO-639-1 code
-    //   prompt           (optional) — initial prompt / context
-    //   response_format  (optional) — json|verbose_json|text|srt|vtt
-    //   temperature      (optional) — sampling temperature
-    //   timestamp_granularities[] (optional) — word|segment (verbose_json)
+    // Accepts OpenAI fields plus kobbler-ecosystem extensions:
+    //   file                       (optional) — audio file (multipart upload)
+    //   file_path                  (optional, kobbler) — server-side path
+    //   model                      (optional) — ignored (we use the loaded model)
+    //   language                   (optional) — ISO-639-1 code
+    //   prompt                     (optional) — initial prompt / context
+    //   response_format            (optional) — json|verbose_json|text|srt|vtt|kobbler
+    //   temperature                (optional) — sampling temperature
+    //   timestamp_granularities[]  (optional) — word|segment (verbose_json)
+    //   timestamp_granularity      (optional, kobbler) — segment|word|char
+    //   beam_size                  (optional, kobbler) — silently ignored by parakeet (greedy TDT)
+    //   cancel_url                 (optional, kobbler) — between-chunks GPU preemption signal
+    //
+    // One of `file` or `file_path` is required. Kobbler clients use file_path
+    // to skip multi-GB multipart uploads when the audio is already mounted
+    // into the container.
     // -----------------------------------------------------------------------
     svr.Post("/v1/audio/transcriptions", [&](const Request& req, Response& res) {
         if (!require_auth(req, res))
             return;
-        if (!ready.load()) {
-            json_error(res, 503, "model is still loading");
+        touch_last_request();
+        if (!ensure_loaded(res))
             return;
-        }
-        if (!req.has_file("file")) {
-            json_error(res, 400, "missing required field 'file'");
-            return;
-        }
 
-        auto audio_file = req.get_file_value("file");
-        fprintf(stderr, "crispasr-server: /v1/audio/transcriptions received '%s' (%zu bytes)\n",
-                audio_file.filename.c_str(), audio_file.content.size());
+        // Audio source: file_path (kobbler) takes precedence over multipart file.
+        std::string audio_path;
+        bool tmp_owned = false;
+        const std::string file_path = form_string(req, "file_path");
+        if (!file_path.empty()) {
+            audio_path = file_path;
+            fprintf(stderr, "crispasr-server: /v1/audio/transcriptions file_path='%s'\n", audio_path.c_str());
+        } else if (req.has_file("file")) {
+            auto audio_file = req.get_file_value("file");
+            fprintf(stderr, "crispasr-server: /v1/audio/transcriptions received '%s' (%zu bytes)\n",
+                    audio_file.filename.c_str(), audio_file.content.size());
+            audio_path = write_temp_audio(audio_file.content.data(), audio_file.content.size());
+            if (audio_path.empty()) {
+                json_error(res, 500, "failed to create temporary file for audio");
+                return;
+            }
+            tmp_owned = true;
+        } else {
+            json_error(res, 400, "missing audio: provide multipart 'file' or form 'file_path'");
+            return;
+        }
 
         // Parse OpenAI form fields.
-        std::string response_format = form_string(req, "response_format", "json");
         std::string language = form_string(req, "language", params.language);
         std::string prompt = form_string(req, "prompt", "");
         float temperature = form_float(req, "temperature", params.temperature);
 
+        // Kobbler extensions. Koblem clients identify themselves implicitly via
+        // these fields — koblem's stt.rs::apply_params only ever populates them
+        // — so we use their presence to select the kobbler response shape when
+        // response_format isn't explicitly set. OpenAI clients (which send
+        // multipart `file` and never these extras) get the OpenAI default.
+        std::string granularity = form_string(req, "timestamp_granularity", "segment");
+        const std::string cancel_url = form_string(req, "cancel_url");
+        const bool kobbler_hint = !file_path.empty() || !cancel_url.empty() ||
+                                  req.has_param("timestamp_granularity") || req.has_file("timestamp_granularity") ||
+                                  req.has_param("beam_size") || req.has_file("beam_size");
+        std::string response_format = form_string(req, "response_format", kobbler_hint ? "kobbler" : "json");
+
         // Validate response_format early.
         if (response_format != "json" && response_format != "verbose_json" && response_format != "text" &&
-            response_format != "srt" && response_format != "vtt") {
+            response_format != "srt" && response_format != "vtt" && response_format != "kobbler") {
+            if (tmp_owned)
+                std::remove(audio_path.c_str());
             json_error(res, 400,
                        "invalid response_format '" + response_format +
-                           "'; must be one of: json, verbose_json, text, srt, vtt");
+                           "'; must be one of: json, verbose_json, text, srt, vtt, kobbler");
             return;
         }
 
@@ -510,15 +694,18 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         if (!prompt.empty())
             rp.prompt = prompt;
 
-        auto result = do_transcribe(audio_file, backend.get(), model_mutex, rp);
+        auto result = do_transcribe(audio_path, backend.get(), model_mutex, rp, cancel_url);
+        if (tmp_owned)
+            std::remove(audio_path.c_str());
+
         if (!result.ok) {
             json_error(res, 400, result.error);
             return;
         }
 
-        fprintf(stderr, "crispasr-server: transcribed %.1fs audio in %.2fs (%.1fx realtime), format=%s\n",
+        fprintf(stderr, "crispasr-server: transcribed %.1fs audio in %.2fs (%.1fx realtime), format=%s%s\n",
                 result.duration_s, result.elapsed_s, result.elapsed_s > 0 ? result.duration_s / result.elapsed_s : 0.0,
-                response_format.c_str());
+                response_format.c_str(), result.preempted ? " [preempted]" : "");
 
         // Format response.
         if (response_format == "text") {
@@ -529,13 +716,17 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             res.set_content(crispasr_segments_to_vtt(result.segs), "text/vtt; charset=utf-8");
         } else if (response_format == "verbose_json") {
             std::string task = rp.translate ? "translate" : "transcribe";
-            res.set_content(crispasr_segments_to_openai_verbose_json(result.segs, result.duration_s, result.language,
-                                                                     task, temperature),
+            res.set_content(
+                crispasr_segments_to_openai_verbose_json(result.segs, result.duration_s, language, task, temperature),
+                "application/json");
+        } else if (response_format == "kobbler") {
+            res.set_content(crispasr_segments_to_kobbler_json(result.segs, granularity, language, result.preempted),
                             "application/json");
         } else {
             // Default: json — {"text": "..."}
             res.set_content(crispasr_segments_to_openai_json(result.segs), "application/json");
         }
+        touch_last_request();
     });
 
     // -----------------------------------------------------------------------
@@ -545,13 +736,11 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         if (!require_auth(req, res))
             return;
         std::lock_guard<std::mutex> lock(model_mutex);
-        ready.store(false);
 
         std::string new_model = form_string(req, "model");
         std::string new_backend = form_string(req, "backend");
 
         if (new_model.empty()) {
-            ready.store(true);
             json_error(res, 400, "no 'model' field");
             return;
         }
@@ -563,53 +752,79 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         if (new_backend.empty() && new_model_is_auto)
             new_backend = "whisper";
         if (new_backend.empty()) {
-            ready.store(true);
             json_error(res, 400, "cannot detect backend for model '" + new_model + "'");
             return;
         }
 
-        const std::string resolved_model =
-            crispasr_resolve_model_cli(new_model, new_backend, params.no_prints, params.cache_dir,
-                                       params.auto_download || new_model_is_auto, params.model_quant);
-        if (resolved_model.empty()) {
-            ready.store(true);
+        // Snapshot prior config so we can roll back if the new backend fails.
+        const std::string prior_backend_name = backend_name;
+        const std::string prior_model = params.model;
+        whisper_params new_params = params;
+        new_params.model = new_model;
+        new_params.backend = new_backend;
+        std::string new_backend_name = new_backend;
+
+        if (!resolve_model_into_params(new_params, new_backend_name)) {
             json_error(res, 500, "failed to resolve model '" + new_model + "' for backend '" + new_backend + "'");
             return;
         }
 
-        whisper_params np = params;
-        np.model = resolved_model;
-        np.backend = new_backend;
-
-        auto nb = crispasr_create_backend(new_backend);
-        if (!nb || !nb->init(np)) {
-            ready.store(true); // keep old model
-            json_error(res, 500, "failed to load model '" + resolved_model + "' with backend '" + new_backend + "'");
+        // Commit the new params + backend_name; load_backend_locked builds the
+        // new backend before dropping the prior one, so a failed init leaves
+        // `backend` pointing at the still-alive previous model — we just need
+        // to restore params/backend_name so /v1/models reflects reality.
+        params = new_params;
+        backend_name = new_backend_name;
+        if (!load_backend_locked()) {
+            params.model = prior_model;
+            backend_name = prior_backend_name;
+            json_error(res, 500, "failed to load model '" + new_params.model + "' with backend '" + new_backend + "'");
             return;
         }
 
-        backend = std::move(nb);
-        backend_name = new_backend;
-        params.model = resolved_model;
-        ready.store(true);
-
-        fprintf(stderr, "crispasr-server: hot-swapped to '%s' backend, model '%s'\n", new_backend.c_str(),
-                resolved_model.c_str());
-        res.set_content("{\"status\": \"ok\", \"backend\": \"" + crispasr_json_escape(new_backend) + "\"}",
+        fprintf(stderr, "crispasr-server: hot-swapped to '%s' backend, model '%s'\n", backend_name.c_str(),
+                params.model.c_str());
+        res.set_content("{\"status\": \"ok\", \"backend\": \"" + crispasr_json_escape(backend_name) + "\"}",
                         "application/json");
     });
 
     // -----------------------------------------------------------------------
+    // POST /unload — free model + GPU memory
+    //
+    // Matches kobbler/docker/parakeet-stt/server.py:/unload semantics so the
+    // GPU gate (api/src/gpu_lock.rs) can ask either backend to release VRAM
+    // when a higher-priority service needs it. Sets model_loaded=false; lazy
+    // mode means the next inference request reloads.
+    // -----------------------------------------------------------------------
+    svr.Post("/unload", [&](const Request& req, Response& res) {
+        if (!require_auth(req, res))
+            return;
+        std::lock_guard<std::mutex> lock(model_mutex);
+        free_backend_locked();
+        res.set_content("{\"status\": \"unloaded\"}", "application/json");
+    });
+
+    // -----------------------------------------------------------------------
     // GET /health
+    //
+    // Shape matches what koblem's SttClient (api/src/stt.rs::HealthInfo)
+    // tolerates plus extras: {status, model_loaded, backend, model}.
+    // status="loading" only during the brief window between server bind and
+    // initial-load completion (eager mode); lazy mode reports "ok" with
+    // model_loaded=false until the first request triggers load.
     // -----------------------------------------------------------------------
     svr.Get("/health", [&](const Request&, Response& res) {
-        if (ready.load()) {
-            res.set_content("{\"status\": \"ok\", \"backend\": \"" + crispasr_json_escape(backend_name) + "\"}",
-                            "application/json");
-        } else {
+        const bool loaded = model_loaded.load();
+        const bool serving = ready.load() || lazy_load;
+        std::ostringstream js;
+        js << "{\"status\": \"" << (serving ? "ok" : "loading") << "\"";
+        js << ", \"model_loaded\": " << (loaded ? "true" : "false");
+        js << ", \"backend\": \"" << crispasr_json_escape(backend_name) << "\"";
+        js << ", \"model\": \"" << crispasr_json_escape(params.model) << "\"";
+        js << "}";
+        if (!serving)
             res.status = 503;
-            res.set_content("{\"status\": \"loading\"}", "application/json");
-        }
+        res.set_content(js.str(), "application/json");
     });
 
     // -----------------------------------------------------------------------
@@ -694,11 +909,10 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     svr.Post("/v1/audio/speech", [&](const Request& req, Response& res) {
         if (!require_auth(req, res))
             return;
-        if (!ready.load()) {
-            json_error(res, 503, "model is still loading");
+        touch_last_request();
+        if (!ensure_loaded(res))
             return;
-        }
-        if (!(backend->capabilities() & CAP_TTS)) {
+        if (!backend || !(backend->capabilities() & CAP_TTS)) {
             json_error(res, 400,
                        "loaded backend '" + backend_name +
                            "' does not support TTS (no CAP_TTS); load a TTS backend "
@@ -849,6 +1063,10 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     svr.Get("/v1/voices", [&](const Request& req, Response& res) {
         if (!require_auth(req, res))
             return;
+        if (!model_loaded.load() || !backend) {
+            json_error(res, 503, "no model loaded");
+            return;
+        }
         if (!(backend->capabilities() & CAP_TTS)) {
             json_error(res, 400,
                        "loaded backend '" + backend_name +
@@ -901,7 +1119,10 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
 
     // Start
     // -----------------------------------------------------------------------
-    const bool tts = (backend->capabilities() & CAP_TTS) != 0;
+    // backend may be null in lazy mode; gate the TTS-banner on whether we
+    // actually have a loaded backend, otherwise just suppress the TTS lines
+    // until the first /load (which can swap to a TTS backend at runtime).
+    const bool tts = (backend && (backend->capabilities() & CAP_TTS) != 0);
     fprintf(stderr, "\ncrispasr-server: listening on %s:%d\n", host.c_str(), port);
     fprintf(stderr, "  POST /inference                  — upload audio (native JSON)\n");
     fprintf(stderr, "  POST /v1/audio/transcriptions    — OpenAI-compatible API\n");
@@ -909,6 +1130,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         fprintf(stderr, "  POST /v1/audio/speech            — TTS (OpenAI-compatible)\n");
     }
     fprintf(stderr, "  POST /load                       — hot-swap model\n");
+    fprintf(stderr, "  POST /unload                     — free model + GPU memory\n");
     fprintf(stderr, "  GET  /health                     — server status\n");
     fprintf(stderr, "  GET  /backends                   — list backends\n");
     fprintf(stderr, "  GET  /v1/models                  — model info\n");
@@ -922,7 +1144,52 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     fprintf(stderr, "\n");
     if (!api_keys.empty())
         fprintf(stderr, "crispasr-server: API key authentication enabled\n");
+    if (lazy_load)
+        fprintf(stderr, "crispasr-server: lazy-load enabled (model loads on first request)\n");
+    if (idle_unload_seconds > 0)
+        fprintf(stderr, "crispasr-server: idle-unload after %ds of inactivity\n", idle_unload_seconds);
+
+    // Idle-unload watchdog. Wakes once a second; when the model is loaded
+    // and last_request_ms is older than the threshold, frees the backend.
+    // Stops cleanly via watchdog_stop on listen() return — we'd rather have
+    // a tidy join() on shutdown than detach() and race container teardown.
+    std::atomic<bool> watchdog_stop{false};
+    std::condition_variable watchdog_cv;
+    std::mutex watchdog_cv_mutex;
+    std::thread watchdog;
+    if (idle_unload_seconds > 0) {
+        watchdog = std::thread([&]() {
+            for (;;) {
+                std::unique_lock<std::mutex> lk(watchdog_cv_mutex);
+                if (watchdog_cv.wait_for(lk, std::chrono::seconds(1), [&]() { return watchdog_stop.load(); }))
+                    return;
+                lk.unlock();
+                if (!model_loaded.load())
+                    continue;
+                const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                           std::chrono::steady_clock::now().time_since_epoch())
+                                           .count();
+                const int64_t last = last_request_ms.load();
+                if (last == 0)
+                    continue; // never received a request — leave loaded
+                if ((now_ms - last) >= (int64_t)idle_unload_seconds * 1000) {
+                    fprintf(stderr, "crispasr-server: idle %ds since last request — unloading\n", idle_unload_seconds);
+                    std::lock_guard<std::mutex> lock(model_mutex);
+                    free_backend_locked();
+                }
+            }
+        });
+    }
 
     svr.listen(host, port);
+
+    if (watchdog.joinable()) {
+        {
+            std::lock_guard<std::mutex> lk(watchdog_cv_mutex);
+            watchdog_stop.store(true);
+        }
+        watchdog_cv.notify_all();
+        watchdog.join();
+    }
     return 0;
 }

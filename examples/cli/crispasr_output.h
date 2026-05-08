@@ -117,6 +117,22 @@ std::string crispasr_segments_to_openai_verbose_json(const std::vector<crispasr_
 std::string crispasr_segments_to_native_json(const std::vector<crispasr_segment>& segs, const std::string& backend_name,
                                              double duration_s);
 
+// Kobbler/koblem-shaped JSON for the kobbler ecosystem's STT consumer
+// (api/src/stt.rs::TranscribeResponse). Differs from OpenAI verbose_json:
+//   - flat top-level "segments" / "words" / "chars" arrays (not nested per-segment)
+//   - each item is {start: f64 sec, end: f64 sec, text: str, id?: i64}
+//   - "segments" is the granularity-selected primary list (segment|word|char)
+//   - "words" / "chars" are always populated when available
+//   - "preempted" is true if cancel_url signalled mid-transcription
+//   - chars[] is always [] for backends that don't expose char timing (parakeet-tdt)
+//
+// Backends that return one segment per chunk (parakeet) get the segment
+// list re-derived from words at sentence-final punctuation / max_duration /
+// max_words boundaries so read-along highlighting is granular enough.
+std::string crispasr_segments_to_kobbler_json(const std::vector<crispasr_segment>& segs,
+                                              const std::string& granularity, const std::string& language,
+                                              bool preempted);
+
 // Remove punctuation from a segment in-place: from seg.text, each
 // seg.words[i].text, and each seg.tokens[i].text. Called by the
 // dispatch layer when --no-punctuation is set and the backend didn't
