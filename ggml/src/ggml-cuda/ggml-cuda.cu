@@ -61,6 +61,7 @@
 #include "ggml-cuda/tri.cuh"
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
+#include "ggml-cuda/parakeet_megakernel.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -2625,7 +2626,60 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         nb1, nb2, nb3, stream);
 }
 
+// One-shot per-op kernel-level timing. PARAKEET_OP_TIMING=N caps total
+// number of timed ops at N; PARAKEET_OP_TIMING=1 picks default 1000
+// (covers an encoder cgraph + several predictor cgraphs on a 30 s clip).
+// Stage A of the megakernel-v0 lap-7 evaluation: characterize what
+// fraction of lap-6's pred-p50 / joint-p50 is dispatch vs compute.
+//
+// Output format (one line per op):
+//   parakeet[op] #042 MUL_MAT  ne0=2560 ne1=1  src0=F16 src1=F32  kernel=0.7us
+static int parakeet_op_timing_remaining() {
+    static int cap = -1;
+    if (cap < 0) {
+        const char * e = std::getenv("PARAKEET_OP_TIMING");
+        if (!e || !e[0] || e[0] == '0') {
+            cap = 0;
+        } else {
+            int n = atoi(e);
+            cap = (n <= 1) ? 1000 : n;
+        }
+    }
+    return cap;
+}
+
+static bool ggml_cuda_compute_forward_inner(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst);
+
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+    static int budget = parakeet_op_timing_remaining();
+    if (budget <= 0) {
+        return ggml_cuda_compute_forward_inner(ctx, dst);
+    }
+    cudaStream_t stream = ctx.stream();
+    cudaEvent_t a, b;
+    cudaEventCreate(&a);
+    cudaEventCreate(&b);
+    cudaEventRecord(a, stream);
+    bool ok = ggml_cuda_compute_forward_inner(ctx, dst);
+    cudaEventRecord(b, stream);
+    cudaEventSynchronize(b);
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, a, b);
+    static int counter = 0;
+    fprintf(stderr, "parakeet[op] #%03d %-22s ne0=%lld ne1=%lld  src0=%s src1=%s  kernel=%.2fus\n",
+            counter++,
+            ggml_op_name(dst->op),
+            (long long)dst->ne[0], (long long)dst->ne[1],
+            dst->src[0] ? ggml_type_name(dst->src[0]->type) : "-",
+            dst->src[1] ? ggml_type_name(dst->src[1]->type) : "-",
+            ms * 1000.0f);
+    cudaEventDestroy(a);
+    cudaEventDestroy(b);
+    budget--;
+    return ok;
+}
+
+static bool ggml_cuda_compute_forward_inner(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
@@ -2951,6 +3005,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_FILL:
             ggml_cuda_op_fill(ctx, dst);
+            break;
+        case GGML_OP_PARAKEET_LSTM_STEP:
+            ggml_cuda_op_parakeet_lstm_step(ctx, dst);
+            break;
+        case GGML_OP_PARAKEET_JOINT:
+            ggml_cuda_op_parakeet_joint(ctx, dst);
             break;
         default:
             return false;
@@ -5213,6 +5273,46 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_DIAG:
         case GGML_OP_SOLVE_TRI:
             return true;
+        case GGML_OP_PARAKEET_LSTM_STEP: {
+            // F16 weights (embed + 4 LSTM W matrices/layer), F32 biases,
+            // F32 state (h0/c0/h1/c1), I32 tok_id. Quant variants are
+            // Commit 4 in MEGAKERNEL-SPEC.md; until they land, sched
+            // routes the op away on non-F16 builds and the parakeet
+            // graph builder picks the multi-op path instead.
+            //
+            // src[] index map: see ggml.h ggml_parakeet_lstm_step.
+            const ggml_type want_lstm[9] = {
+                GGML_TYPE_F16, // 0: embed_w
+                GGML_TYPE_F16, // 1: lstm0_w_ih
+                GGML_TYPE_F32, // 2: lstm0_b_ih
+                GGML_TYPE_F16, // 3: lstm0_w_hh
+                GGML_TYPE_F32, // 4: lstm0_b_hh
+                GGML_TYPE_F16, // 5: lstm1_w_ih
+                GGML_TYPE_F32, // 6: lstm1_b_ih
+                GGML_TYPE_F16, // 7: lstm1_w_hh
+                GGML_TYPE_F32, // 8: lstm1_b_hh
+            };
+            for (int i = 0; i < 9; i++) {
+                if (!op->src[i] || op->src[i]->type != want_lstm[i]) return false;
+            }
+            for (int i = 9; i <= 12; i++) {
+                if (!op->src[i] || op->src[i]->type != GGML_TYPE_F32) return false;
+            }
+            if (!op->src[13] || op->src[13]->type != GGML_TYPE_I32) return false;
+            return op->src[14] && op->src[14]->type == GGML_TYPE_F32;  // gates_buf
+        }
+        case GGML_OP_PARAKEET_JOINT: {
+            // enc_w/pred_w/out_w F16; enc_b/pred_b/out_b F32; enc_t/h1/mid_buf F32.
+            const ggml_tensor * const w[3] = { op->src[0], op->src[2], op->src[4] };
+            const ggml_tensor * const b[3] = { op->src[1], op->src[3], op->src[5] };
+            for (int i = 0; i < 3; i++) {
+                if (!w[i] || w[i]->type != GGML_TYPE_F16) return false;
+                if (!b[i] || b[i]->type != GGML_TYPE_F32) return false;
+            }
+            if (!op->src[6] || op->src[6]->type != GGML_TYPE_F32) return false;
+            if (!op->src[7] || op->src[7]->type != GGML_TYPE_F32) return false;
+            return op->src[8] && op->src[8]->type == GGML_TYPE_F32;     // mid_buf
+        }
 
         default:
             return false;

@@ -1078,9 +1078,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "PARAKEET_LSTM_STEP",
+    "PARAKEET_JOINT",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1188,9 +1191,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "parakeet_lstm_step(t, h, c, W)",
+    "parakeet_joint(enc, pred, W)",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -7316,6 +7322,98 @@ void ggml_graph_add_node(struct ggml_cgraph * cgraph, struct ggml_tensor * tenso
     GGML_ASSERT(cgraph->size > cgraph->n_nodes);
     cgraph->nodes[cgraph->n_nodes] = tensor;
     cgraph->n_nodes++;
+}
+
+void ggml_graph_set_uid(struct ggml_cgraph * cgraph, uint64_t uid) {
+    cgraph->uid = uid;
+}
+
+// ----- parakeet.cpp megakernel-v0 (local fork) ----------------------------
+// See ggml.h for source-array semantics. Both builders attach all input
+// tensors via src[] (relying on the local GGML_MAX_SRC bump to 16 for the
+// LSTM step's 14 inputs) and produce a placeholder/result output tensor.
+// The CUDA backend reads the real outputs by writing through the
+// persistent state tensors' device pointers; gallocr leaves them alone
+// because they already carry buffer/data from the persistent state_buf.
+
+struct ggml_tensor * ggml_parakeet_lstm_step(
+        struct ggml_context * ctx,
+        struct ggml_tensor * embed_w,
+        struct ggml_tensor * lstm0_w_ih,
+        struct ggml_tensor * lstm0_b_ih,
+        struct ggml_tensor * lstm0_w_hh,
+        struct ggml_tensor * lstm0_b_hh,
+        struct ggml_tensor * lstm1_w_ih,
+        struct ggml_tensor * lstm1_b_ih,
+        struct ggml_tensor * lstm1_w_hh,
+        struct ggml_tensor * lstm1_b_hh,
+        struct ggml_tensor * h0,
+        struct ggml_tensor * c0,
+        struct ggml_tensor * h1,
+        struct ggml_tensor * c1,
+        struct ggml_tensor * tok_id,
+        struct ggml_tensor * gates_buf) {
+    GGML_ASSERT(embed_w && lstm0_w_ih && lstm0_b_ih && lstm0_w_hh && lstm0_b_hh);
+    GGML_ASSERT(lstm1_w_ih && lstm1_b_ih && lstm1_w_hh && lstm1_b_hh);
+    GGML_ASSERT(h0 && c0 && h1 && c1 && tok_id && gates_buf);
+
+    // Placeholder result tensor — the meaningful outputs are the in-place
+    // mutations on h0/c0/h1/c1. ggml needs a dst node to schedule, and
+    // gallocr needs something to allocate; [1] F32 is enough for both.
+    const int64_t ne[1] = { 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 1, ne);
+
+    result->op      = GGML_OP_PARAKEET_LSTM_STEP;
+    result->src[ 0] = embed_w;
+    result->src[ 1] = lstm0_w_ih;
+    result->src[ 2] = lstm0_b_ih;
+    result->src[ 3] = lstm0_w_hh;
+    result->src[ 4] = lstm0_b_hh;
+    result->src[ 5] = lstm1_w_ih;
+    result->src[ 6] = lstm1_b_ih;
+    result->src[ 7] = lstm1_w_hh;
+    result->src[ 8] = lstm1_b_hh;
+    result->src[ 9] = h0;
+    result->src[10] = c0;
+    result->src[11] = h1;
+    result->src[12] = c1;
+    result->src[13] = tok_id;
+    result->src[14] = gates_buf;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_parakeet_joint(
+        struct ggml_context * ctx,
+        struct ggml_tensor * enc_w,
+        struct ggml_tensor * enc_b,
+        struct ggml_tensor * pred_w,
+        struct ggml_tensor * pred_b,
+        struct ggml_tensor * out_w,
+        struct ggml_tensor * out_b,
+        struct ggml_tensor * enc_t,
+        struct ggml_tensor * h1,
+        struct ggml_tensor * mid_buf) {
+    GGML_ASSERT(enc_w && enc_b && pred_w && pred_b && out_w && out_b);
+    GGML_ASSERT(enc_t && h1 && mid_buf);
+
+    // Output is [V] F32 logits, V == out_w->ne[1] in ggml convention.
+    const int64_t V = out_w->ne[1];
+    const int64_t ne[1] = { V };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 1, ne);
+
+    result->op      = GGML_OP_PARAKEET_JOINT;
+    result->src[0]  = enc_w;
+    result->src[1]  = enc_b;
+    result->src[2]  = pred_w;
+    result->src[3]  = pred_b;
+    result->src[4]  = out_w;
+    result->src[5]  = out_b;
+    result->src[6]  = enc_t;
+    result->src[7]  = h1;
+    result->src[8]  = mid_buf;
+
+    return result;
 }
 
 struct ggml_tensor * ggml_graph_get_tensor(const struct ggml_cgraph * cgraph, const char * name) {

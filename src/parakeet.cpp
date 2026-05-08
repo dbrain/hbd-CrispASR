@@ -33,6 +33,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -81,6 +82,24 @@ struct parakeet_timing {
     int n_blanks = 0;                  // blank steps
     int n_t_steps = 0;                 // outer t-loop iterations
     int T_enc = 0;                     // encoder frames (set by encoder timing block)
+
+    // Per-call distributions (PARAKEET_TIMING=1, GPU TDT path).
+    // Captured to answer "is the per-step cost a stable floor or noisy"
+    // — speculative decode (lever 4 in HANDOFF-perf-6) is only worth it
+    // if blanks dominate AND per-call cost has a tight distribution.
+    // Cost: ~360 doubles + ~80 doubles per clip ≈ 4 KB. Vector<double>
+    // because we want p50/p95/max, not just mean.
+    std::vector<double> joint_step_us;  // wall-clock of each inner joint call (µs)
+    std::vector<double> pred_step_us;   // wall-clock of each predictor call (µs)
+
+    // Joint-step cost split by outcome. Total = blank + emit + (re-evals
+    // before emit, lumped into emit since they cost the same shape).
+    // Tells us how much joint time is spent on "wasted" blank checks
+    // — the headroom for speculative decode.
+    double t_joint_step_blank_ms = 0.0;
+    double t_joint_step_emit_ms = 0.0;
+    int n_joint_step_blank = 0;
+    int n_joint_step_emit = 0;
 };
 
 static inline bool parakeet_timing_enabled() {
@@ -258,6 +277,33 @@ struct parakeet_tdt_gpu_state {
     // Single i32 [1] slot for the predictor's input token id (uploaded per
     // emit step). Lives on backend so embed-row-gather is a backend op.
     ggml_tensor* tok_id = nullptr;
+
+    // Megakernel-v0 lap-7 multi-block scratch buffers. Allocated alongside
+    // h0/c0/h1/c1 in state_buf so they have stable device pointers across
+    // all calls (CUDA-graph-replayable).
+    //
+    //   gates_buf [4H] F32 — both LSTM layers stream their gate dot products
+    //                        through this buffer between the gates kernel
+    //                        and the activate kernel. Layer 0 → activate 0
+    //                        → layer 1 (overwrites buffer) → activate 1.
+    //   mid_buf   [J]  F32 — joint head stage 1 ReLU intermediate. Read by
+    //                        stage 2 (logits) to produce final V-element
+    //                        output.
+    ggml_tensor* gates_buf = nullptr;
+    ggml_tensor* mid_buf   = nullptr;
+
+    // Lap-6 lever D2: persistent step graphs. Build once, reuse forever —
+    // shapes are stable so there is no reason to rebuild the cgraph each
+    // call. Saves the per-call ggml_init + tensor allocation + graph
+    // construction overhead, which dominated the cached cost in lever D1
+    // (joint 42 µs, pred 75 µs). Each lives in its own metadata buffer so
+    // the encoder's compute_meta reuse can't stomp on them.
+    std::vector<uint8_t> pred_meta;
+    ggml_context* pred_meta_ctx = nullptr;
+    ggml_cgraph* pred_graph = nullptr;
+    std::vector<uint8_t> joint_meta;
+    ggml_context* joint_meta_ctx = nullptr;
+    ggml_cgraph* joint_graph = nullptr;
 };
 
 struct parakeet_context {
@@ -289,6 +335,19 @@ struct parakeet_context {
     // lazily on first encoder call when PARAKEET_ENC_CACHE != 0. Releases via
     // ggml_gallocr_free in parakeet_free.
     ggml_gallocr_t enc_gallocr = nullptr;
+
+    // Lap-6 lever D1: same trick applied to the decode-side step graphs.
+    // Without this both `tdt_gpu_run_predictor` and `tdt_gpu_run_joint` ran
+    // through `ggml_backend_sched_graph_compute` and rebuilt their cgraphs
+    // every call, so the CUDA backend never captured a reusable graph and
+    // the per-call cost was dominated by sched alloc + launch overhead.
+    // Both step graphs are shape-stable (predictor takes int tok_id +
+    // persistent LSTM state, joint takes fixed [d_model] enc_t + persistent
+    // h1) so a dedicated gallocr per graph captures one CUDA graph each
+    // and replays it on subsequent calls. Default ON; PARAKEET_DEC_CACHE=0
+    // falls back to the lap-2 sched path.
+    ggml_gallocr_t pred_gallocr = nullptr;
+    ggml_gallocr_t joint_gallocr = nullptr;
 
     int n_threads = 4;
 
@@ -460,6 +519,7 @@ static bool parakeet_load_model(parakeet_model& model, parakeet_vocab& vocab, co
 
         e.norm_out_w = get("norm_out.weight");
         e.norm_out_b = get("norm_out.bias");
+
     }
 
     // Predictor
@@ -1400,24 +1460,29 @@ static void parakeet_tdt_gpu_init(parakeet_context* ctx) {
     const int D = (int)ctx->model.hparams.d_model;
 
     ggml_init_params p = {
-        /*mem_size=*/ggml_tensor_overhead() * 16,
+        /*mem_size=*/ggml_tensor_overhead() * 32,
         /*mem_buffer=*/nullptr,
         /*no_alloc=*/true,
     };
     s.state_ctx = ggml_init(p);
 
+    const int J = (int)ctx->model.hparams.joint_hidden;
     s.h0 = ggml_new_tensor_1d(s.state_ctx, GGML_TYPE_F32, H);
     s.c0 = ggml_new_tensor_1d(s.state_ctx, GGML_TYPE_F32, H);
     s.h1 = ggml_new_tensor_1d(s.state_ctx, GGML_TYPE_F32, H);
     s.c1 = ggml_new_tensor_1d(s.state_ctx, GGML_TYPE_F32, H);
     s.enc_t = ggml_new_tensor_1d(s.state_ctx, GGML_TYPE_F32, D);
     s.tok_id = ggml_new_tensor_1d(s.state_ctx, GGML_TYPE_I32, 1);
+    s.gates_buf = ggml_new_tensor_1d(s.state_ctx, GGML_TYPE_F32, 4 * H);
+    s.mid_buf   = ggml_new_tensor_1d(s.state_ctx, GGML_TYPE_F32, J);
     ggml_set_name(s.h0, "tdt.h0");
     ggml_set_name(s.c0, "tdt.c0");
     ggml_set_name(s.h1, "tdt.h1");
     ggml_set_name(s.c1, "tdt.c1");
     ggml_set_name(s.enc_t, "tdt.enc_t");
     ggml_set_name(s.tok_id, "tdt.tok_id");
+    ggml_set_name(s.gates_buf, "tdt.gates_buf");
+    ggml_set_name(s.mid_buf, "tdt.mid_buf");
 
     s.state_buf = ggml_backend_alloc_ctx_tensors(s.state_ctx, ctx->backend);
     if (!s.state_buf) {
@@ -1482,18 +1547,75 @@ static lstm_layer_out tdt_gpu_lstm_layer(ggml_context* ctx0, ggml_tensor* x,
     return {h_new, c_new};
 }
 
-static ggml_cgraph* parakeet_build_predictor_graph(parakeet_context* ctx) {
+// Read PARAKEET_MEGAKERNEL toggle once. Default OFF — needs explicit
+// opt-in until parity is verified per MEGAKERNEL-SPEC.md Gate 1. The
+// builder also gates on weight types (F16 only, see uses below); we
+// log on first call when the flag was set but the gate fell through,
+// so the user notices a silent quant fallback.
+static inline bool parakeet_megakernel_enabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* e = getenv("PARAKEET_MEGAKERNEL");
+        cached = (e && e[0] && e[0] != '0' && strcmp(e, "false") != 0) ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+static inline bool parakeet_megakernel_predictor_eligible(const parakeet_predictor& p) {
+    // Embedding lookup + 4 LSTM weight matrices must be F16. Biases must
+    // be F32 (they always are at GGUF load time — quantize.cpp leaves
+    // 1D tensors alone). The kernel asserts on type mismatch so this
+    // gate exists to choose the fused vs. multi-op build path.
+    return p.embed_w    && p.embed_w->type    == GGML_TYPE_F16
+        && p.lstm0_w_ih && p.lstm0_w_ih->type == GGML_TYPE_F16
+        && p.lstm0_w_hh && p.lstm0_w_hh->type == GGML_TYPE_F16
+        && p.lstm1_w_ih && p.lstm1_w_ih->type == GGML_TYPE_F16
+        && p.lstm1_w_hh && p.lstm1_w_hh->type == GGML_TYPE_F16;
+}
+
+static inline bool parakeet_megakernel_joint_eligible(const parakeet_joint& j) {
+    return j.enc_w  && j.enc_w->type  == GGML_TYPE_F16
+        && j.pred_w && j.pred_w->type == GGML_TYPE_F16
+        && j.out_w  && j.out_w->type  == GGML_TYPE_F16;
+}
+
+// Build the predictor graph into the supplied ggml_context. Caller owns
+// ctx0 — this function does NOT call ggml_free on it. Used both by the
+// per-call legacy path (which allocates + frees its own ctx0 wrapper)
+// and the persistent cached path (which keeps ctx0 alive for the
+// lifetime of the parakeet_context).
+static ggml_cgraph* parakeet_build_predictor_graph_into(parakeet_context* ctx, ggml_context* ctx0) {
     auto& s = ctx->tdt_gpu;
     auto& p = ctx->model.predictor;
     const int H = (int)ctx->model.hparams.pred_hidden;
-
-    ggml_init_params ip = {
-        /*mem_size=*/ctx->compute_meta.size(),
-        /*mem_buffer=*/ctx->compute_meta.data(),
-        /*no_alloc=*/true,
-    };
-    ggml_context* ctx0 = ggml_init(ip);
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 256, false);
+
+    // Megakernel-v0 fused path: 16 ggml ops -> 1. State writeback is
+    // in-place inside the kernel via raw pointers to s.h0/c0/h1/c1's
+    // backing storage (already-allocated persistent state_buf), so no
+    // ggml_cpy ops needed — they were the dispatch overhead the
+    // megakernel exists to eliminate.
+    if (parakeet_megakernel_enabled() && parakeet_megakernel_predictor_eligible(p)) {
+        ggml_tensor* mega = ggml_parakeet_lstm_step(ctx0,
+            p.embed_w,
+            p.lstm0_w_ih, p.lstm0_b_ih, p.lstm0_w_hh, p.lstm0_b_hh,
+            p.lstm1_w_ih, p.lstm1_b_ih, p.lstm1_w_hh, p.lstm1_b_hh,
+            s.h0, s.c0, s.h1, s.c1, s.tok_id, s.gates_buf);
+        ggml_set_name(mega, "tdt.lstm_step");
+        ggml_build_forward_expand(gf, mega);
+        return gf;
+    } else if (parakeet_megakernel_enabled()) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr,
+                "parakeet: PARAKEET_MEGAKERNEL=1 but predictor weights are not F16 "
+                "(embed=%s lstm0_w_ih=%s) — falling back to multi-op cgraph build "
+                "(quant variants are MEGAKERNEL-SPEC.md Commit 4)\n",
+                p.embed_w    ? ggml_type_name(p.embed_w->type)    : "?",
+                p.lstm0_w_ih ? ggml_type_name(p.lstm0_w_ih->type) : "?");
+        }
+    }
 
     // x = embed_w[tok_id]. embed_w is [H, vocab+1], gather row.
     ggml_tensor* x_row = ggml_get_rows(ctx0, p.embed_w, s.tok_id);
@@ -1517,23 +1639,48 @@ static ggml_cgraph* parakeet_build_predictor_graph(parakeet_context* ctx) {
     ggml_build_forward_expand(gf, w_h1);
     ggml_build_forward_expand(gf, w_c1);
 
-    ggml_free(ctx0);
     return gf;
 }
 
-static ggml_cgraph* parakeet_build_joint_graph(parakeet_context* ctx) {
-    auto& s = ctx->tdt_gpu;
-    auto& j = ctx->model.joint;
-    const int joint_hidden = (int)ctx->model.hparams.joint_hidden;
-    (void)joint_hidden;
-
+static ggml_cgraph* parakeet_build_predictor_graph(parakeet_context* ctx) {
     ggml_init_params ip = {
         /*mem_size=*/ctx->compute_meta.size(),
         /*mem_buffer=*/ctx->compute_meta.data(),
         /*no_alloc=*/true,
     };
     ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = parakeet_build_predictor_graph_into(ctx, ctx0);
+    ggml_free(ctx0);
+    return gf;
+}
+
+static ggml_cgraph* parakeet_build_joint_graph_into(parakeet_context* ctx, ggml_context* ctx0) {
+    auto& s = ctx->tdt_gpu;
+    auto& j = ctx->model.joint;
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 64, false);
+
+    // Megakernel-v0 fused path: 8 ggml ops -> 1.
+    if (parakeet_megakernel_enabled() && parakeet_megakernel_joint_eligible(j)) {
+        ggml_tensor* logits = ggml_parakeet_joint(ctx0,
+            j.enc_w,  j.enc_b,
+            j.pred_w, j.pred_b,
+            j.out_w,  j.out_b,
+            s.enc_t,  s.h1, s.mid_buf);
+        ggml_set_name(logits, "tdt.logits");
+        ggml_build_forward_expand(gf, logits);
+        return gf;
+    } else if (parakeet_megakernel_enabled()) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr,
+                "parakeet: PARAKEET_MEGAKERNEL=1 but joint weights are not F16 "
+                "(enc=%s pred=%s out=%s) — falling back to multi-op cgraph build\n",
+                j.enc_w  ? ggml_type_name(j.enc_w->type)  : "?",
+                j.pred_w ? ggml_type_name(j.pred_w->type) : "?",
+                j.out_w  ? ggml_type_name(j.out_w->type)  : "?");
+        }
+    }
 
     // joint_in_e = enc_w @ enc_t + enc_b      [joint_hidden]
     ggml_tensor* je = ggml_add(ctx0, ggml_mul_mat(ctx0, j.enc_w, s.enc_t), j.enc_b);
@@ -1546,8 +1693,67 @@ static ggml_cgraph* parakeet_build_joint_graph(parakeet_context* ctx) {
     ggml_set_name(logits, "tdt.logits");
     ggml_build_forward_expand(gf, logits);
 
+    return gf;
+}
+
+static ggml_cgraph* parakeet_build_joint_graph(parakeet_context* ctx) {
+    ggml_init_params ip = {
+        /*mem_size=*/ctx->compute_meta.size(),
+        /*mem_buffer=*/ctx->compute_meta.data(),
+        /*no_alloc=*/true,
+    };
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = parakeet_build_joint_graph_into(ctx, ctx0);
     ggml_free(ctx0);
     return gf;
+}
+
+// Read the PARAKEET_DEC_CACHE toggle once. Default ON. Set to "0"/"false"
+// to fall back to the lap-2 sched path for bisection / debugging.
+static inline bool parakeet_dec_cache_enabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* e = getenv("PARAKEET_DEC_CACHE");
+        if (e && *e && (strcmp(e, "0") == 0 || strcmp(e, "false") == 0))
+            cached = 0;
+        else
+            cached = 1;
+    }
+    return cached != 0;
+}
+
+// Run a step graph through either a dedicated gallocr (default) or sched
+// (fallback). Both decode-side step graphs (predictor, joint) share this
+// logic — only the gallocr handle differs.
+static bool tdt_gpu_step_compute(parakeet_context* ctx, ggml_cgraph* gf,
+                                 ggml_gallocr_t* gallocr_slot, const char* tag) {
+    if (parakeet_dec_cache_enabled()) {
+        if (!*gallocr_slot) {
+            *gallocr_slot = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+        }
+        if (*gallocr_slot) {
+            if (!ggml_gallocr_alloc_graph(*gallocr_slot, gf)) {
+                fprintf(stderr, "parakeet: %s gallocr alloc failed\n", tag);
+                return false;
+            }
+            if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
+                fprintf(stderr, "parakeet: %s compute failed (gallocr)\n", tag);
+                return false;
+            }
+            return true;
+        }
+        fprintf(stderr, "parakeet: %s gallocr_new failed; falling back to sched\n", tag);
+    }
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        fprintf(stderr, "parakeet: %s sched alloc failed\n", tag);
+        return false;
+    }
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "parakeet: %s sched compute failed\n", tag);
+        return false;
+    }
+    return true;
 }
 
 // Run the predictor graph once with `token_id` as the LSTM input.
@@ -1557,17 +1763,27 @@ static bool tdt_gpu_run_predictor(parakeet_context* ctx, int token_id) {
     int32_t tid = (int32_t)token_id;
     ggml_backend_tensor_set(s.tok_id, &tid, 0, sizeof(int32_t));
 
-    ggml_cgraph* gf = parakeet_build_predictor_graph(ctx);
-    ggml_backend_sched_reset(ctx->sched);
-    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
-        fprintf(stderr, "parakeet: tdt_gpu predictor alloc failed\n");
-        return false;
+    // Lap-6 lever D2: build the cgraph once, reuse forever on the cached
+    // path. Drops per-call cost from "ggml_init + ~10 ops + ggml_free"
+    // down to a gallocr no-op-walk + backend_graph_compute. Sched
+    // fallback still rebuilds each call so PARAKEET_DEC_CACHE=0 stays
+    // bisection-clean.
+    ggml_cgraph* gf;
+    if (parakeet_dec_cache_enabled() && !s.pred_graph) {
+        s.pred_meta.resize(ggml_tensor_overhead() * 256 + ggml_graph_overhead_custom(256, false));
+        ggml_init_params ip = {s.pred_meta.size(), s.pred_meta.data(), /*no_alloc=*/true};
+        s.pred_meta_ctx = ggml_init(ip);
+        s.pred_graph = parakeet_build_predictor_graph_into(ctx, s.pred_meta_ctx);
+        // Lap-6 lever D3: assign a stable nonzero uid so ggml_cuda_graph_update_required
+        // hits its fast-path early-return (ggml-cuda.cu:3141) on every call after the
+        // first. Without this, the per-call cost includes a full node-property memcmp
+        // walk (~5-15 µs at our op count). The uid only matters within this process,
+        // doesn't need to collide-with-anything-globally — pick a fixed nonzero per
+        // graph slot.
+        ggml_graph_set_uid(s.pred_graph, 0xC0DEC0DE00000001ULL);
     }
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "parakeet: tdt_gpu predictor compute failed\n");
-        return false;
-    }
-    return true;
+    gf = s.pred_graph ? s.pred_graph : parakeet_build_predictor_graph(ctx);
+    return tdt_gpu_step_compute(ctx, gf, &ctx->pred_gallocr, "tdt_gpu predictor");
 }
 
 // Run the joint graph once with `enc_t_data` as the encoder frame input.
@@ -1577,16 +1793,19 @@ static bool tdt_gpu_run_joint(parakeet_context* ctx, const float* enc_t_data, in
     auto& s = ctx->tdt_gpu;
     ggml_backend_tensor_set(s.enc_t, enc_t_data, 0, (size_t)d_model * sizeof(float));
 
-    ggml_cgraph* gf = parakeet_build_joint_graph(ctx);
-    ggml_backend_sched_reset(ctx->sched);
-    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
-        fprintf(stderr, "parakeet: tdt_gpu joint alloc failed\n");
-        return false;
+    auto& s_jg = ctx->tdt_gpu;
+    ggml_cgraph* gf;
+    if (parakeet_dec_cache_enabled() && !s_jg.joint_graph) {
+        s_jg.joint_meta.resize(ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(64, false));
+        ggml_init_params ip = {s_jg.joint_meta.size(), s_jg.joint_meta.data(), /*no_alloc=*/true};
+        s_jg.joint_meta_ctx = ggml_init(ip);
+        s_jg.joint_graph = parakeet_build_joint_graph_into(ctx, s_jg.joint_meta_ctx);
+        // Lap-6 lever D3: same uid trick as the predictor — distinct constant.
+        ggml_graph_set_uid(s_jg.joint_graph, 0xC0DEC0DE00000002ULL);
     }
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "parakeet: tdt_gpu joint compute failed\n");
+    gf = s_jg.joint_graph ? s_jg.joint_graph : parakeet_build_joint_graph(ctx);
+    if (!tdt_gpu_step_compute(ctx, gf, &ctx->joint_gallocr, "tdt_gpu joint"))
         return false;
-    }
     ggml_tensor* logits = ggml_graph_get_tensor(gf, "tdt.logits");
     if (!logits) {
         fprintf(stderr, "parakeet: tdt_gpu joint missing logits tensor\n");
@@ -1618,7 +1837,11 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode_gpu(parakeet_cont
         auto _t = clk::now();
         if (!tdt_gpu_run_predictor(ctx, blank_id))
             return {};
-        if (tim) tim->t_pred_step_ms += ms_since(_t);
+        if (tim) {
+            const double dt = ms_since(_t);
+            tim->t_pred_step_ms += dt;
+            tim->pred_step_us.push_back(dt * 1000.0);
+        }
     }
 
     std::vector<parakeet_emitted_token> emitted;
@@ -1636,13 +1859,18 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode_gpu(parakeet_cont
         int n_inner = 0;
         while (n_inner < max_per_step) {
             // Joint graph: takes enc_t + persistent h1 (== pred_out) → logits.
+            // js_ms held in outer scope so the blank/emit branches below can
+            // attribute this step's cost to the right bucket.
+            double js_ms = 0.0;
             {
                 auto _t = clk::now();
                 if (!tdt_gpu_run_joint(ctx, enc_t, d_model, logits))
                     return emitted;
+                js_ms = ms_since(_t);
                 if (tim) {
-                    tim->t_joint_step_ms += ms_since(_t);
+                    tim->t_joint_step_ms += js_ms;
                     tim->n_inner_steps++;
+                    tim->joint_step_us.push_back(js_ms * 1000.0);
                 }
             }
 
@@ -1698,6 +1926,8 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode_gpu(parakeet_cont
                 if (tim) {
                     tim->t_argmax_softmax_ms += ms_since(_t_argmax);
                     tim->n_blanks++;
+                    tim->t_joint_step_blank_ms += js_ms;
+                    tim->n_joint_step_blank++;
                 }
                 t += std::max(1, dur_skip);
                 break;
@@ -1710,7 +1940,11 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode_gpu(parakeet_cont
                     sum += std::exp((double)(logits[v] - tok_lp));
                 tok_p = sum > 0.0 ? (float)(1.0 / sum) : 0.0f;
             }
-            if (tim) tim->t_argmax_softmax_ms += ms_since(_t_argmax);
+            if (tim) {
+                tim->t_argmax_softmax_ms += ms_since(_t_argmax);
+                tim->t_joint_step_emit_ms += js_ms;
+                tim->n_joint_step_emit++;
+            }
 
             int t_end = std::min(T_enc, t + std::max(0, dur_skip));
             emitted.push_back({tok, t, t_end, tok_p});
@@ -1719,7 +1953,9 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode_gpu(parakeet_cont
                 if (!tdt_gpu_run_predictor(ctx, tok))
                     return emitted;
                 if (tim) {
-                    tim->t_pred_step_ms += ms_since(_t);
+                    const double dt = ms_since(_t);
+                    tim->t_pred_step_ms += dt;
+                    tim->pred_step_us.push_back(dt * 1000.0);
                     tim->n_emits++;
                 }
             }
@@ -2018,12 +2254,20 @@ extern "C" void parakeet_free(struct parakeet_context* ctx) {
         ggml_backend_buffer_free(ctx->tdt_gpu.state_buf);
     if (ctx->tdt_gpu.state_ctx)
         ggml_free(ctx->tdt_gpu.state_ctx);
+    if (ctx->tdt_gpu.pred_meta_ctx)
+        ggml_free(ctx->tdt_gpu.pred_meta_ctx);
+    if (ctx->tdt_gpu.joint_meta_ctx)
+        ggml_free(ctx->tdt_gpu.joint_meta_ctx);
     if (ctx->mel_gpu.state_buf)
         ggml_backend_buffer_free(ctx->mel_gpu.state_buf);
     if (ctx->mel_gpu.state_ctx)
         ggml_free(ctx->mel_gpu.state_ctx);
     if (ctx->enc_gallocr)
         ggml_gallocr_free(ctx->enc_gallocr);
+    if (ctx->pred_gallocr)
+        ggml_gallocr_free(ctx->pred_gallocr);
+    if (ctx->joint_gallocr)
+        ggml_gallocr_free(ctx->joint_gallocr);
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->model.buf)
@@ -2220,6 +2464,296 @@ extern "C" int parakeet_run_encoder_dump(struct parakeet_context* ctx, const flo
     return 0;
 }
 
+// ===========================================================================
+// Lap-5 lever 1: per-stage encoder profiler
+//
+// Runs the encoder via the sched path with an eval-callback that breaks on
+// tagged sub-stage tensors. Each break forces a backend synchronize, so the
+// host chrono captures real GPU time per segment. The sched path inflates
+// the total cost relative to the lap-4 gallocr cache (no whole-encoder CUDA
+// graph capture), but the per-stage *ratios* are what we want.
+//
+// Tags inserted (via core_conformer's profile_hook):
+//   p_pre        — after pre-encode (xscaling already applied)
+//   pL{K}_ff1    — after FFN1 macaron half of layer K
+//   pL{K}_attn   — after rel-pos self-attn of layer K
+//   pL{K}_conv   — after conformer conv module of layer K
+//   pL{K}_ff2    — after FFN2 macaron half of layer K
+//   pL{K}_end    — after block-final LN of layer K
+//   p_enc_out    — final encoder output
+// ===========================================================================
+
+namespace {
+struct enc_profile_state {
+    using clk = std::chrono::high_resolution_clock;
+    clk::time_point t_prev;
+    std::vector<std::pair<std::string, double>> stage_ms;  // name → ms
+};
+
+void enc_profile_hook(void* user, const char* stage, ggml_tensor* t) {
+    int* layer = (int*)user;
+    char nm[64];
+    snprintf(nm, sizeof(nm), "pL%d_%s", *layer, stage);
+    ggml_set_name(t, nm);
+    ggml_set_output(t);
+}
+
+// Build profile graph: same shape as the lap-4 production encoder, but with
+// per-stage tags inserted via the new BlockParams::profile_hook. The chained
+// `cur = tag` trick from the dump path is NOT used — set_output keeps the
+// tagged tensors live, and each tag is the natural output of its stage
+// (the residual-add or final-LN), so no extra ops are inserted.
+ggml_cgraph* build_profile_encoder(parakeet_context* ctx, int T_mel) {
+    const auto& m = ctx->model;
+    const auto& hp = m.hparams;
+    const int n_mels = (int)hp.n_mels;
+
+    ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 8192, false);
+
+    ggml_tensor* mel = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_mels, T_mel);
+    ggml_set_name(mel, "mel");
+    ggml_set_input(mel);
+
+    int T = 0;
+    ggml_tensor* cur = core_conformer::build_pre_encode(ctx0, mel, m.pre_encode, (int)hp.subsampling_channels, &T);
+    if (hp.xscaling) {
+        const float xscale = sqrtf((float)hp.d_model);
+        cur = ggml_scale(ctx0, cur, xscale);
+    }
+    ggml_set_name(cur, "p_pre");
+    ggml_set_output(cur);
+
+    ggml_tensor* pos_enc = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, (int)hp.d_model, 2 * T - 1);
+    ggml_set_name(pos_enc, "pos_enc");
+    ggml_set_input(pos_enc);
+
+    int cur_layer = 0;
+    core_conformer::BlockParams bp = {
+        (int)hp.d_model, (int)hp.n_heads, (int)hp.head_dim, (int)hp.conv_kernel, kLayerNormEps,
+    };
+    bp.profile_hook = enc_profile_hook;
+    bp.profile_user = &cur_layer;
+    for (uint32_t il = 0; il < hp.n_layers; il++) {
+        cur_layer = (int)il;
+        cur = core_conformer::build_block(ctx0, cur, pos_enc, T, m.enc[il], bp);
+    }
+
+    ggml_set_name(cur, "p_enc_out");
+    ggml_build_forward_expand(gf, cur);
+    ggml_free(ctx0);
+    return gf;
+}
+
+bool enc_profile_callback(ggml_tensor* t, bool ask, void* ud) {
+    auto* st = (enc_profile_state*)ud;
+    const char* name = t->name;
+    bool is_break = (name[0] == 'p' && (name[1] == '_' || name[1] == 'L'));
+    if (ask) {
+        return is_break;
+    } else {
+        // ask=false fires after the backend has been synchronized for the
+        // [j0..j1] range whose last node is `t`. Chrono delta = real GPU
+        // time for that segment.
+        auto now = enc_profile_state::clk::now();
+        double dt = std::chrono::duration<double, std::milli>(now - st->t_prev).count();
+        st->stage_ms.emplace_back(std::string(name), dt);
+        st->t_prev = now;
+        return true;
+    }
+}
+} // anonymous namespace
+
+extern "C" int parakeet_profile_encoder(struct parakeet_context* ctx, const float* mel, int n_mels, int T_mel) {
+    if (!ctx || !mel || T_mel <= 0)
+        return 1;
+    if (n_mels != (int)ctx->model.hparams.n_mels) {
+        fprintf(stderr, "parakeet[profile]: mel feature mismatch (%d vs %d)\n", n_mels,
+                (int)ctx->model.hparams.n_mels);
+        return 2;
+    }
+
+    if (!ctx->sched) {
+        ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
+        int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
+        ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 8192, false, false);
+    }
+    if (ctx->compute_meta.empty()) {
+        ctx->compute_meta.resize(ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false));
+    }
+
+    auto setup_inputs = [&](ggml_cgraph* gf) {
+        ggml_tensor* mel_in = ggml_graph_get_tensor(gf, "mel");
+        ggml_backend_tensor_set(mel_in, mel, 0, (size_t)n_mels * T_mel * sizeof(float));
+        ggml_tensor* pos_in = ggml_graph_get_tensor(gf, "pos_enc");
+        int T_enc = (int)pos_in->ne[1];
+        T_enc = (T_enc + 1) / 2;
+        auto pe = core_conformer::make_pos_enc((int)ctx->model.hparams.d_model, T_enc);
+        ggml_backend_tensor_set(pos_in, pe.data(), 0, pe.size() * sizeof(float));
+    };
+
+    // Warmup pass (no callback — alloc/CUDA-graph capture overhead burned in).
+    {
+        ggml_cgraph* gf = build_profile_encoder(ctx, T_mel);
+        ggml_backend_sched_reset(ctx->sched);
+        if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+            fprintf(stderr, "parakeet[profile]: warmup alloc failed\n");
+            return 3;
+        }
+        setup_inputs(gf);
+        if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "parakeet[profile]: warmup compute failed\n");
+            return 4;
+        }
+    }
+
+    // Measured pass.
+    enc_profile_state st;
+    st.stage_ms.reserve(256);
+
+    ggml_cgraph* gf = build_profile_encoder(ctx, T_mel);
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        fprintf(stderr, "parakeet[profile]: measured alloc failed\n");
+        return 3;
+    }
+    setup_inputs(gf);
+
+    ggml_backend_sched_set_eval_callback(ctx->sched, enc_profile_callback, &st);
+
+    auto t_start = enc_profile_state::clk::now();
+    st.t_prev = t_start;
+
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "parakeet[profile]: measured compute failed\n");
+        ggml_backend_sched_set_eval_callback(ctx->sched, nullptr, nullptr);
+        return 4;
+    }
+
+    ggml_backend_sched_set_eval_callback(ctx->sched, nullptr, nullptr);
+
+    double total_ms = std::chrono::duration<double, std::milli>(
+                          enc_profile_state::clk::now() - t_start).count();
+
+    // Aggregate per layer.
+    const int n_layers = (int)ctx->model.hparams.n_layers;
+    // Top-level stages: ff1, attn, conv, ff2, block_end
+    std::vector<std::array<double, 5>> per_layer(n_layers, {0, 0, 0, 0, 0});
+    // Conv sub-stages: cv_norm, cv_mm1, cv_pw1(=GLU after mm1), cv_pre, cv_dw,
+    // cv_post, cv_pw2 (everything between cv_post and conv tag).
+    std::vector<std::array<double, 7>> per_layer_cv(n_layers, {0, 0, 0, 0, 0, 0, 0});
+    double t_pre = 0.0;
+    auto stage_idx = [](const std::string& s) -> int {
+        if (s == "ff1") return 0;
+        if (s == "attn") return 1;
+        if (s == "conv") return 2;
+        if (s == "ff2") return 3;
+        if (s == "block_end") return 4;
+        return -1;
+    };
+    auto cv_idx = [](const std::string& s) -> int {
+        if (s == "cv_norm") return 0;
+        if (s == "cv_mm1") return 1;
+        if (s == "cv_pw1") return 2;  // GLU only (mm1 already broken out)
+        if (s == "cv_pre") return 3;
+        if (s == "cv_dw") return 4;
+        if (s == "cv_post") return 5;
+        return -1;
+    };
+    for (auto& kv : st.stage_ms) {
+        const std::string& name = kv.first;
+        double ms = kv.second;
+        if (name == "p_pre") {
+            t_pre += ms;
+            continue;
+        }
+        if (name == "p_enc_out") continue;  // final LN already counted as last block_end
+        if (name.size() < 4 || name[0] != 'p' || name[1] != 'L') continue;
+        size_t us = name.find('_');
+        if (us == std::string::npos) continue;
+        int L = atoi(name.c_str() + 2);
+        if (L < 0 || L >= n_layers) continue;
+        std::string stage = name.substr(us + 1);
+        int cvi = cv_idx(stage);
+        if (cvi >= 0) {
+            per_layer_cv[L][cvi] += ms;
+            // Conv sub-stages roll up into the top-level "conv" bucket below.
+            per_layer[L][2] += ms;
+            continue;
+        }
+        int si = stage_idx(stage);
+        if (si < 0) continue;
+        per_layer[L][si] += ms;
+        // The "conv" tag is emitted at the end of the conv module; it carries
+        // the pw2 + residual segment (between cv_post and conv tag) when
+        // sub-stage tags are present. Stash as cv_pw2 (index 6 in per_layer_cv).
+        if (si == 2) per_layer_cv[L][6] += ms;
+    }
+
+    fprintf(stderr, "\n=== parakeet[profile] T_mel=%d  total=%.2f ms (sched-path, inflated vs cache) ===\n",
+            T_mel, total_ms);
+    fprintf(stderr, "pre_encode (incl xscaling)  %.2f ms\n", t_pre);
+    fprintf(stderr, "%-5s %-8s %-8s %-8s %-8s %-9s %-8s\n",
+            "L", "ff1", "attn", "conv", "ff2", "blk_end", "total");
+    double sum_ff1 = 0, sum_attn = 0, sum_conv = 0, sum_ff2 = 0, sum_end = 0, sum_total = 0;
+    for (int L = 0; L < n_layers; L++) {
+        double tot = per_layer[L][0] + per_layer[L][1] + per_layer[L][2] + per_layer[L][3] + per_layer[L][4];
+        sum_ff1 += per_layer[L][0];
+        sum_attn += per_layer[L][1];
+        sum_conv += per_layer[L][2];
+        sum_ff2 += per_layer[L][3];
+        sum_end += per_layer[L][4];
+        sum_total += tot;
+        fprintf(stderr, "%-5d %-8.2f %-8.2f %-8.2f %-8.2f %-9.2f %-8.2f\n",
+                L, per_layer[L][0], per_layer[L][1], per_layer[L][2], per_layer[L][3], per_layer[L][4], tot);
+    }
+    fprintf(stderr, "%-5s %-8.2f %-8.2f %-8.2f %-8.2f %-9.2f %-8.2f\n",
+            "SUM", sum_ff1, sum_attn, sum_conv, sum_ff2, sum_end, sum_total);
+    fprintf(stderr, "%-5s %-7.1f%% %-7.1f%% %-7.1f%% %-7.1f%% %-8.1f%%\n",
+            "%",
+            100.0 * sum_ff1 / std::max(1e-9, sum_total),
+            100.0 * sum_attn / std::max(1e-9, sum_total),
+            100.0 * sum_conv / std::max(1e-9, sum_total),
+            100.0 * sum_ff2 / std::max(1e-9, sum_total),
+            100.0 * sum_end / std::max(1e-9, sum_total));
+
+    // Conv sub-stage breakdown (only meaningful when cv_* tags fire).
+    double sum_cv_norm = 0, sum_cv_mm1 = 0, sum_cv_pw1 = 0, sum_cv_pre = 0,
+           sum_cv_dw = 0, sum_cv_post = 0, sum_cv_pw2 = 0;
+    for (int L = 0; L < n_layers; L++) {
+        sum_cv_norm += per_layer_cv[L][0];
+        sum_cv_mm1  += per_layer_cv[L][1];
+        sum_cv_pw1  += per_layer_cv[L][2];
+        sum_cv_pre  += per_layer_cv[L][3];
+        sum_cv_dw   += per_layer_cv[L][4];
+        sum_cv_post += per_layer_cv[L][5];
+        sum_cv_pw2  += per_layer_cv[L][6];
+    }
+    double cv_total = sum_cv_norm + sum_cv_mm1 + sum_cv_pw1 + sum_cv_pre + sum_cv_dw + sum_cv_post + sum_cv_pw2;
+    if (cv_total > 1e-3) {
+        fprintf(stderr, "\nconv module breakdown (within %.2f ms total conv time):\n", cv_total);
+        fprintf(stderr, "  cv_norm  (LN + scale + bias)              %7.2f ms  %5.1f%%\n",
+                sum_cv_norm, 100.0 * sum_cv_norm / cv_total);
+        fprintf(stderr, "  cv_mm1   (pw1 mul_mat d→2d + bias)        %7.2f ms  %5.1f%%\n",
+                sum_cv_mm1, 100.0 * sum_cv_mm1 / cv_total);
+        fprintf(stderr, "  cv_pw1   (GLU: view + sigmoid + mul)      %7.2f ms  %5.1f%%\n",
+                sum_cv_pw1, 100.0 * sum_cv_pw1 / cv_total);
+        fprintf(stderr, "  cv_pre   (cast dw_w + transpose+cont+rsh) %7.2f ms  %5.1f%%\n",
+                sum_cv_pre, 100.0 * sum_cv_pre / cv_total);
+        fprintf(stderr, "  cv_dw    (conv_2d_dw_direct kernel)       %7.2f ms  %5.1f%%\n",
+                sum_cv_dw, 100.0 * sum_cv_dw / cv_total);
+        fprintf(stderr, "  cv_post  (permute+cont+rsh+bias+silu)     %7.2f ms  %5.1f%%\n",
+                sum_cv_post, 100.0 * sum_cv_post / cv_total);
+        fprintf(stderr, "  cv_pw2   (pw2 d→d + residual add)         %7.2f ms  %5.1f%%\n",
+                sum_cv_pw2, 100.0 * sum_cv_pw2 / cv_total);
+    }
+
+    fprintf(stderr, "===\n\n");
+
+    return 0;
+}
+
 extern "C" int parakeet_test_encoder(struct parakeet_context* ctx, int T_mel) {
     int n_mels = (int)ctx->model.hparams.n_mels;
     std::vector<float> mel((size_t)n_mels * T_mel, 0.0f);
@@ -2358,6 +2892,18 @@ extern "C" struct parakeet_result* parakeet_transcribe_ex(struct parakeet_contex
     if (getenv("PARAKEET_DEBUG"))
         fprintf(stderr, "parakeet: mel OK (%d frames)\n", T_mel);
 
+    // 2a. Optional one-shot encoder profile (lap-5 lever 1).
+    // PARAKEET_PROFILE_ENC=1 dumps a per-layer/per-stage breakdown on the
+    // first call only, then proceeds with the normal encode below.
+    {
+        static int profile_done = 0;
+        const char* pe = getenv("PARAKEET_PROFILE_ENC");
+        if (!profile_done && pe && *pe && strcmp(pe, "0") != 0) {
+            profile_done = 1;
+            parakeet_profile_encoder(ctx, mel.data(), (int)ctx->model.hparams.n_mels, T_mel);
+        }
+    }
+
     // 2. Encoder
     int T_enc = 0;
     auto _t_enc = clk::now();
@@ -2421,6 +2967,45 @@ extern "C" struct parakeet_result* parakeet_transcribe_ex(struct parakeet_contex
                 clip_ms / 1000.0, rtf, total, tim->t_mel_ms, tim->t_encoder_ms, tim->T_enc, tim->t_decode_ms,
                 tim->t_pred_step_ms, tim->n_emits, tim->t_joint_proj_enc_ms, tim->n_t_steps, tim->t_joint_step_ms,
                 tim->n_inner_steps, tim->t_argmax_softmax_ms, tim->n_blanks);
+
+        // Per-step distribution + blank/emit cost split (GPU TDT path).
+        // Answers: is per-call cost a stable floor (launch-overhead-bound,
+        // speculative decode could fold K calls) or noisy (variable work
+        // dominates, fold less effective)? And: how much joint time is
+        // spent on blank checks vs real emits — the headroom for spec.
+        if (!tim->joint_step_us.empty()) {
+            auto pct = [](std::vector<double>& v, double q) {
+                if (v.empty()) return 0.0;
+                size_t k = (size_t)((v.size() - 1) * q);
+                std::nth_element(v.begin(), v.begin() + (long)k, v.end());
+                return v[k];
+            };
+            std::vector<double> js = tim->joint_step_us;  // copy for nth_element
+            std::vector<double> ps = tim->pred_step_us;
+            const double js_p50 = pct(js, 0.50);
+            const double js_p95 = pct(js, 0.95);
+            const double js_max = js.empty() ? 0.0 : *std::max_element(js.begin(), js.end());
+            const double ps_p50 = pct(ps, 0.50);
+            const double ps_p95 = pct(ps, 0.95);
+            const double ps_max = ps.empty() ? 0.0 : *std::max_element(ps.begin(), ps.end());
+            const double js_blank_avg_us = tim->n_joint_step_blank > 0
+                ? (tim->t_joint_step_blank_ms * 1000.0 / tim->n_joint_step_blank) : 0.0;
+            const double js_emit_avg_us = tim->n_joint_step_emit > 0
+                ? (tim->t_joint_step_emit_ms * 1000.0 / tim->n_joint_step_emit) : 0.0;
+            const double blank_share = tim->n_inner_steps > 0
+                ? 100.0 * (double)tim->n_joint_step_blank / (double)tim->n_inner_steps : 0.0;
+            fprintf(stderr,
+                    "parakeet[decode] per-step joint p50=%.0fµs p95=%.0fµs max=%.0fµs | "
+                    "pred p50=%.0fµs p95=%.0fµs max=%.0fµs | "
+                    "blank=%d (%.1f%%, %.0fµs avg) emit=%d (%.0fµs avg) | "
+                    "spec_headroom=%.1fms (%.1f%% of dec)\n",
+                    js_p50, js_p95, js_max,
+                    ps_p50, ps_p95, ps_max,
+                    tim->n_joint_step_blank, blank_share, js_blank_avg_us,
+                    tim->n_joint_step_emit, js_emit_avg_us,
+                    tim->t_joint_step_blank_ms,
+                    tim->t_decode_ms > 0 ? 100.0 * tim->t_joint_step_blank_ms / tim->t_decode_ms : 0.0);
+        }
     }
 
     // 4. Build result

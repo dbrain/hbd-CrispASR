@@ -132,6 +132,16 @@ int parakeet_run_encoder_dump(struct parakeet_context* ctx, const float* mel, in
 // encoder-output statistics. Returns T_enc on success or -1.
 int parakeet_test_audio(struct parakeet_context* ctx, const float* samples, int n_samples);
 
+// Per-stage encoder profiler (lap-5 lever 1).
+// Runs the encoder once through the sched path with eval-callback breakpoints
+// at each conformer block's ff1/attn/conv/ff2/block_end, plus pre_encode and
+// the final-LN. Each break forces a backend synchronize so chrono captures
+// real GPU time. Sched-path inflates total cost vs the lap-4 gallocr cache,
+// but per-stage *ratios* are accurate. Prints a per-layer table to stderr.
+// Returns 0 on success, non-zero on failure. Use PARAKEET_PROFILE_ENC=1 for
+// auto-trigger from parakeet_transcribe_ex (runs once and continues).
+int parakeet_profile_encoder(struct parakeet_context* ctx, const float* mel, int n_mels, int T_mel);
+
 #ifdef __cplusplus
 }
 #endif

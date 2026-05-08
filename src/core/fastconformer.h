@@ -180,6 +180,15 @@ struct BlockParams {
     int head_dim; // d / n_heads
     int K;        // conv_kernel (usually 9)
     float ln_eps; // LayerNorm epsilon
+
+    // Optional profile hook — invoked after each major sub-stage with
+    // (user, stage, tensor). When non-null, the caller can name the
+    // tensor and call ggml_set_output() so a sched eval-callback can
+    // break on it for per-stage timing. Stages emitted, in order:
+    //   "ff1", "attn", "conv", "ff2", "block_end".
+    // No-op for non-profile builds (the lap-4 prod path leaves it null).
+    void (*profile_hook)(void* user, const char* stage, ggml_tensor* t) = nullptr;
+    void* profile_user = nullptr;
 };
 
 // Build one Conformer block. `cur` must be (d, T). `pos_enc` is the shared
@@ -208,6 +217,7 @@ static inline ggml_tensor* build_block(ggml_context* ctx0, ggml_tensor* cur, ggm
     x = ggml_silu(ctx0, x);
     x = mm_bias(e.ff1_l2_w, x, e.ff1_l2_b);
     cur = ggml_add(ctx0, inpL, ggml_scale(ctx0, x, 0.5f));
+    if (p.profile_hook) p.profile_hook(p.profile_user, "ff1", cur);
 
     ggml_tensor* inpAttn = cur;
 
@@ -243,6 +253,7 @@ static inline ggml_tensor* build_block(ggml_context* ctx0, ggml_tensor* cur, ggm
 
     attn_out = mm_bias(e.attn_out_w, attn_out, e.attn_out_b);
     cur = ggml_add(ctx0, inpAttn, attn_out);
+    if (p.profile_hook) p.profile_hook(p.profile_user, "attn", cur);
 
     // ---- Conformer convolution module ----
     ggml_tensor* inpConv = cur;
@@ -251,27 +262,36 @@ static inline ggml_tensor* build_block(ggml_context* ctx0, ggml_tensor* cur, ggm
     x = ggml_add(ctx0, x, e.norm_conv_b);
 
     // pw1: (d → 2d), then GLU
+    if (p.profile_hook) p.profile_hook(p.profile_user, "cv_norm", x);
     ggml_tensor* pw1_w = ggml_reshape_2d(ctx0, e.conv_pw1_w, d, 2 * d);
     ggml_tensor* cnv = mm_bias(pw1_w, x, e.conv_pw1_b);
+    if (p.profile_hook) p.profile_hook(p.profile_user, "cv_mm1", cnv);
     ggml_tensor* cnv_gate = ggml_view_2d(ctx0, cnv, d, T, cnv->nb[1], d * sizeof(float));
     cnv = ggml_mul(ctx0, ggml_view_2d(ctx0, cnv, d, T, cnv->nb[1], 0), ggml_sigmoid(ctx0, cnv_gate));
+    if (p.profile_hook) p.profile_hook(p.profile_user, "cv_pw1", cnv);
 
     // dw conv (kernel K, padding K/2). BN was folded into conv_dw_w/b at load.
     ggml_tensor* dw_w_f32 = ggml_cast(ctx0, e.conv_dw_w, GGML_TYPE_F32);
     ggml_tensor* dw_w_4d = ggml_reshape_4d(ctx0, dw_w_f32, K, 1, 1, d);
     cnv = ggml_cont(ctx0, ggml_transpose(ctx0, cnv)); // (d, T) → (T, d)
     cnv = ggml_reshape_4d(ctx0, cnv, T, 1, d, 1);
+    if (p.profile_hook) p.profile_hook(p.profile_user, "cv_pre", cnv);
+
     cnv = ggml_conv_2d_dw_direct(ctx0, dw_w_4d, cnv, 1, 1, (K - 1) / 2, 0, 1, 1);
+    if (p.profile_hook) p.profile_hook(p.profile_user, "cv_dw", cnv);
+
     cnv = ggml_cont(ctx0, ggml_permute(ctx0, cnv, 1, 2, 0, 3));
     cnv = ggml_reshape_2d(ctx0, cnv, d, T);
 
     cnv = ggml_add(ctx0, cnv, ggml_reshape_2d(ctx0, e.conv_dw_b, d, 1));
     cnv = ggml_silu(ctx0, cnv);
+    if (p.profile_hook) p.profile_hook(p.profile_user, "cv_post", cnv);
 
     // pw2: (d → d)
     ggml_tensor* pw2_w = ggml_reshape_2d(ctx0, e.conv_pw2_w, d, d);
     cnv = mm_bias(pw2_w, cnv, e.conv_pw2_b);
     cur = ggml_add(ctx0, inpConv, cnv);
+    if (p.profile_hook) p.profile_hook(p.profile_user, "conv", cur);
 
     // ---- FFN2 (macaron half) ----
     ggml_tensor* inpFF2 = cur;
@@ -282,11 +302,13 @@ static inline ggml_tensor* build_block(ggml_context* ctx0, ggml_tensor* cur, ggm
     x = ggml_silu(ctx0, x);
     x = mm_bias(e.ff2_l2_w, x, e.ff2_l2_b);
     cur = ggml_add(ctx0, inpFF2, ggml_scale(ctx0, x, 0.5f));
+    if (p.profile_hook) p.profile_hook(p.profile_user, "ff2", cur);
 
     // ---- Block final LN ----
     cur = ggml_norm(ctx0, cur, eps);
     cur = ggml_mul(ctx0, cur, e.norm_out_w);
     cur = ggml_add(ctx0, cur, e.norm_out_b);
+    if (p.profile_hook) p.profile_hook(p.profile_user, "block_end", cur);
 
     return cur;
 }
