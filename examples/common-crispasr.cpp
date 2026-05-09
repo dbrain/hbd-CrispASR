@@ -84,7 +84,42 @@ bool read_audio_data(const std::string & fname, std::vector<float>& pcmf32, std:
 
     decoder_config = ma_decoder_config_init(ma_format_f32, stereo ? 2 : 1, CRISPASR_SAMPLE_RATE);
 
-    if (fname == "-") {
+    // For compressed formats with encoder-delay metadata (mp3 LAME / m4a iTunSMPB
+    // / opus pre-skip), prefer libav decoding when CRISPASR_FFMPEG is built in.
+    // miniaudio's drmp3 leaves the LAME delay padding (~1216 samples = 76 ms at
+    // 16 kHz) as leading silence in the PCM buffer, which shifts every word
+    // timestamp by ~76 ms relative to ffmpeg-decoded references. Routing the
+    // file through ffmpeg-transcode.cpp first matches the python NeMo
+    // reference (subprocess `ffmpeg -i file.mp3 -ar 16000 -ac 1 …`) byte-for-byte.
+    auto path_is_compressed = [](const std::string& p) {
+        const char* dot = strrchr(p.c_str(), '.');
+        if (!dot) return false;
+        std::string ext = dot;
+        for (auto& c : ext) c = (char)tolower((unsigned char)c);
+        return ext == ".mp3" || ext == ".m4a" || ext == ".mp4" || ext == ".aac"
+            || ext == ".opus" || ext == ".ogg" || ext == ".oga" || ext == ".webm";
+    };
+
+    bool decoder_ready = false;
+#ifdef CRISPASR_FFMPEG
+    if (fname != "-" && path_is_compressed(fname)) {
+        if (ffmpeg_decode_audio(fname, audio_data) == 0
+            && ma_decoder_init_memory(audio_data.data(), audio_data.size(),
+                                       &decoder_config, &decoder) == MA_SUCCESS) {
+            decoder_ready = true;
+        } else {
+            // Fall through to miniaudio path on libav failure (corrupt mp3 etc.)
+            fprintf(stderr, "%s: libav decode failed for '%s', falling back to miniaudio\n",
+                    __func__, fname.c_str());
+            audio_data.clear();
+        }
+    }
+#endif
+
+    if (decoder_ready) {
+        // libav-decoded WAV bytes are now in `decoder`; skip the stdin / file
+        // bring-up below and go straight to the shared read path.
+    } else if (fname == "-") {
 		#ifdef _WIN32
 		_setmode(_fileno(stdin), _O_BINARY);
 		#endif

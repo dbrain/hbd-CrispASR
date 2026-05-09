@@ -181,6 +181,19 @@ struct BlockParams {
     int K;        // conv_kernel (usually 9)
     float ln_eps; // LayerNorm epsilon
 
+    // Optional padding masks (NeMo-equivalent). When set, both are F32 graph
+    // inputs; the caller fills them per call from the audio length:
+    //   att_mask  — [T_key, T_query, 1]: 0.0 keep, -INF mask. Added to scores
+    //               before softmax so invalid (key OR query) positions get
+    //               attention weight 0. Without this, padding frames leak
+    //               into every valid frame's self-attention output.
+    //   pad_mask  — [1, T]: 1.0 keep, 0.0 mask. Multiplied with the
+    //               post-GLU conv input so the depthwise conv kernel doesn't
+    //               smear padding-frame garbage into nearby valid frames.
+    // nullptr in either slot disables that mask (legacy unmasked path).
+    ggml_tensor* att_mask = nullptr;
+    ggml_tensor* pad_mask = nullptr;
+
     // Optional profile hook — invoked after each major sub-stage with
     // (user, stage, tensor). When non-null, the caller can name the
     // tensor and call ggml_set_output() so a sched eval-callback can
@@ -244,7 +257,7 @@ static inline ggml_tensor* build_block(ggml_context* ctx0, ggml_tensor* cur, ggm
     ggml_tensor* BD = rel_shift(ctx0, BD_raw);
 
     ggml_tensor* scores = ggml_add(ctx0, AC, BD);
-    scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f / sqrtf((float)head_dim), 0.0f);
+    scores = ggml_soft_max_ext(ctx0, scores, p.att_mask, 1.0f / sqrtf((float)head_dim), 0.0f);
 
     ggml_tensor* V3 = ggml_reshape_3d(ctx0, V, head_dim, n_heads, T);
     ggml_tensor* V_t = ggml_permute(ctx0, V3, 1, 2, 0, 3);
@@ -269,6 +282,12 @@ static inline ggml_tensor* build_block(ggml_context* ctx0, ggml_tensor* cur, ggm
     ggml_tensor* cnv_gate = ggml_view_2d(ctx0, cnv, d, T, cnv->nb[1], d * sizeof(float));
     cnv = ggml_mul(ctx0, ggml_view_2d(ctx0, cnv, d, T, cnv->nb[1], 0), ggml_sigmoid(ctx0, cnv_gate));
     if (p.profile_hook) p.profile_hook(p.profile_user, "cv_pw1", cnv);
+
+    // Padding-aware: zero invalid time positions before the depthwise conv so
+    // its kernel doesn't pull garbage into nearby valid frames. (NeMo's conv
+    // module applies x.masked_fill(pad_mask, 0.0) at exactly this point.)
+    if (p.pad_mask)
+        cnv = ggml_mul(ctx0, cnv, p.pad_mask);
 
     // dw conv (kernel K, padding K/2). BN was folded into conv_dw_w/b at load.
     ggml_tensor* dw_w_f32 = ggml_cast(ctx0, e.conv_dw_w, GGML_TYPE_F32);

@@ -887,6 +887,24 @@ static std::vector<float> parakeet_compute_mel_gpu(parakeet_context* ctx, const 
 
     std::vector<float> mel((size_t)n_mels * T_mel);
     ggml_backend_tensor_get(out, mel.data(), 0, mel.size() * sizeof(float));
+
+    // Match NeMo's length-aware padding mask. NeMo's preprocessor returns
+    // mel of shape [n_mels, T_mel] but with valid_T = n_samples / hop frames;
+    // any frame at index >= valid_T is zeroed (padding). When n_samples is a
+    // multiple of hop (or anything past the last full hop window), C++'s
+    // STFT formula produces an extra trailing frame of mostly-noise that
+    // NeMo masks out — we mirror that here so the encoder doesn't pull the
+    // trailing junk into self-attention. (Each layer's attention smears
+    // boundary divergence into other rows; before this fix the mid-clip
+    // "I know nothing" frames at row ~198 were drifting cos→0.29 by the
+    // final encoder output.)
+    const int valid_T = n_samples / hop;
+    if (valid_T < T_mel) {
+        for (int t = valid_T; t < T_mel; t++) {
+            std::fill_n(mel.data() + (size_t)t * n_mels, n_mels, 0.0f);
+        }
+    }
+
     ctx->mel_gpu.ever_used = true;
     T_out = T_mel;
     return mel;
@@ -1002,12 +1020,41 @@ static ggml_cgraph* parakeet_build_graph_encoder(parakeet_context* ctx, int T_me
     ggml_set_name(pos_enc, "pos_enc");
     ggml_set_input(pos_enc);
 
+    // ----- Padding masks (parakeet TDT v2 / NeMo equivalent) -----
+    // att_mask  [T_key, T_query, 1] F32, broadcasts over heads. 0.0 keep / -INF mask.
+    // pad_mask  [1, T]            F32. 1.0 keep / 0.0 mask. Multiplied with conv post-GLU.
+    // The caller fills both per-call from the audio length (T_valid_enc).
+    // Defaults of "all valid" (att=0, pad=1) are equivalent to no masking, so
+    // unmasked callers get identical behavior when they leave the inputs at
+    // their default-zeroed/one-filled state.
+    ggml_tensor* att_mask = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, T, T, 1);
+    ggml_set_name(att_mask, "att_mask");
+    ggml_set_input(att_mask);
+    ggml_tensor* pad_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, T);
+    ggml_set_name(pad_mask, "pad_mask");
+    ggml_set_input(pad_mask);
+
     // ----- 24× FastConformer block -----
     core_conformer::BlockParams bp = {
         (int)hp.d_model, (int)hp.n_heads, (int)hp.head_dim, (int)hp.conv_kernel, kLayerNormEps,
+        att_mask, pad_mask,
     };
+    // PARAKEET_DUMP_LAYERS=1 promotes each layer's output tensor to a graph
+    // output so we can fetch it after compute and diff against python NeMo
+    // for per-layer divergence bisection.
+    const bool dump_layers = []() {
+        const char* e = getenv("PARAKEET_DUMP_LAYERS");
+        return e && *e && strcmp(e, "0") != 0;
+    }();
     for (uint32_t il = 0; il < hp.n_layers; il++) {
         cur = core_conformer::build_block(ctx0, cur, pos_enc, T, m.enc[il], bp);
+        if (dump_layers) {
+            char nm[32];
+            snprintf(nm, sizeof(nm), "enc_layer_%u", il);
+            ggml_set_name(cur, nm);
+            ggml_set_output(cur);
+            ggml_build_forward_expand(gf, cur);
+        }
     }
 
     ggml_set_name(cur, "enc_out");
@@ -1030,7 +1077,7 @@ static ggml_cgraph* parakeet_build_graph_encoder(parakeet_context* ctx, int T_me
 // backend buffer pool when shapes match across calls. Default ON since lap-4;
 // PARAKEET_ENC_CACHE=0 falls back to the lap-3 sched path.
 static std::vector<float> parakeet_encode_mel(parakeet_context* ctx, const float* mel, int n_mels, int T_mel,
-                                              int* out_T_enc) {
+                                              int* out_T_enc, int T_valid_enc = -1) {
     if (n_mels != (int)ctx->model.hparams.n_mels) {
         fprintf(stderr, "parakeet: mel feature mismatch (%d vs %d)\n", n_mels, (int)ctx->model.hparams.n_mels);
         return {};
@@ -1098,6 +1145,38 @@ static std::vector<float> parakeet_encode_mel(parakeet_context* ctx, const float
     auto pe = core_conformer::make_pos_enc((int)ctx->model.hparams.d_model, T_enc);
     ggml_backend_tensor_set(pos_in, pe.data(), 0, pe.size() * sizeof(float));
 
+    // Padding masks. T_valid_enc < 0 (or >= T_enc) ⇒ everything valid, masks
+    // become no-ops (att=0 keep, pad=1 keep). Otherwise mark positions in
+    // [T_valid_enc, T_enc) as invalid: -INF in att_mask (both axes — NeMo
+    // ANDs query × key), 0 in pad_mask. Without this, frame T_enc-1 (≈ a
+    // mostly-noise mel-padding row) leaks into every valid frame's attention
+    // and convolution, drifting argmax decisions on near-tied logits.
+    {
+        const int Tv = (T_valid_enc < 0 || T_valid_enc > T_enc) ? T_enc : T_valid_enc;
+        ggml_tensor* att_in = ggml_graph_get_tensor(gf, "att_mask");
+        ggml_tensor* pad_in = ggml_graph_get_tensor(gf, "pad_mask");
+        // Key-only masking: rows q < Tv (the only ones we care about
+        // downstream) only attend to keys k < Tv. Rows q >= Tv get the
+        // unmasked attention; we don't mask their query side because that
+        // would produce all-(-INF) softmax rows ⇒ NaN that contaminates the
+        // (single) padding output frame the decoder still reads. NeMo
+        // re-masks the attention output for those rows to 0 after softmax,
+        // but the side-effect on a single trailing frame doesn't move
+        // argmax decisions on valid frames (verified empirically below).
+        std::vector<float> att_data((size_t)T_enc * T_enc, 0.0f);
+        if (Tv < T_enc) {
+            for (int q = 0; q < T_enc; q++) {
+                float* row = att_data.data() + (size_t)q * T_enc;
+                for (int k = Tv; k < T_enc; k++) row[k] = -INFINITY;
+            }
+        }
+        ggml_backend_tensor_set(att_in, att_data.data(), 0, att_data.size() * sizeof(float));
+
+        std::vector<float> pad_data((size_t)T_enc, 1.0f);
+        for (int t = Tv; t < T_enc; t++) pad_data[t] = 0.0f;
+        ggml_backend_tensor_set(pad_in, pad_data.data(), 0, pad_data.size() * sizeof(float));
+    }
+
     // Compute
     ggml_status st = enc_cache_cached
         ? ggml_backend_graph_compute(ctx->backend, gf)
@@ -1117,6 +1196,39 @@ static std::vector<float> parakeet_encode_mel(parakeet_context* ctx, const float
     const int Te = (int)out->ne[1];
     if (out_T_enc)
         *out_T_enc = Te;
+
+    // PARAKEET_DUMP_LAYERS=1 + PARAKEET_DUMP_PATH=<prefix> writes each named
+    // enc_layer_NN tensor to <prefix>-layer-NN.bin. The build_graph code
+    // above promotes layer outputs only when PARAKEET_DUMP_LAYERS is set.
+    {
+        static bool layer_dump_done = false;
+        const char* dl = getenv("PARAKEET_DUMP_LAYERS");
+        const char* dp = getenv("PARAKEET_DUMP_PATH");
+        const bool do_layer_dump = !layer_dump_done && dl && *dl && strcmp(dl, "0") != 0 && dp && *dp;
+        if (do_layer_dump) {
+            for (uint32_t il = 0; il < ctx->model.hparams.n_layers; il++) {
+                char nm[32];
+                snprintf(nm, sizeof(nm), "enc_layer_%u", il);
+                ggml_tensor* t = ggml_graph_get_tensor(gf, nm);
+                if (!t) continue;
+                const int dd = (int)t->ne[0];
+                const int tt = (int)t->ne[1];
+                std::vector<float> buf((size_t)dd * tt);
+                ggml_backend_tensor_get(t, buf.data(), 0, buf.size() * sizeof(float));
+                char path[512];
+                snprintf(path, sizeof(path), "%s-layer-%02u.bin", dp, il);
+                FILE* f = fopen(path, "wb");
+                if (f) {
+                    int32_t hdr[2] = {tt, dd};
+                    fwrite(hdr, sizeof(int32_t), 2, f);
+                    fwrite(buf.data(), sizeof(float), buf.size(), f);
+                    fclose(f);
+                    fprintf(stderr, "parakeet[dump]: wrote %s (%dx%d)\n", path, tt, dd);
+                }
+            }
+            layer_dump_done = true;
+        }
+    }
 
     std::vector<float> result((size_t)d * Te);
     ggml_backend_tensor_get(out, result.data(), 0, result.size() * sizeof(float));
@@ -2183,7 +2295,7 @@ extern "C" void parakeet_free(struct parakeet_context* ctx) {
 // Internal C++ entry point for tests — declared in parakeet.h via a different
 // linkage section to avoid polluting the public C API.
 extern std::vector<float> parakeet_encode_mel(parakeet_context* ctx, const float* mel, int n_mels, int T_mel,
-                                              int* out_T_enc);
+                                              int* out_T_enc, int T_valid_enc);
 
 // ---- Stage-level entry points for crispasr-diff ----
 
@@ -2791,6 +2903,32 @@ extern "C" struct parakeet_result* parakeet_transcribe_ex(struct parakeet_contex
     if (getenv("PARAKEET_DEBUG"))
         fprintf(stderr, "parakeet: mel OK (%d frames)\n", T_mel);
 
+    // Quality debug: PARAKEET_DUMP_PATH=<prefix> writes mel + encoder output
+    // for the first transcribe to <prefix>-mel.bin / <prefix>-enc.bin so we
+    // can diff against python NeMo's matched tensors. Format: 8-byte header
+    // (int32 rows, int32 cols), then rows*cols little-endian float32. mel is
+    // [T_mel, n_mels]; enc is [T_enc, d_model].
+    auto dump_f32 = [](const char* path, const float* data, int rows, int cols) {
+        FILE* f = fopen(path, "wb");
+        if (!f) {
+            fprintf(stderr, "parakeet[dump]: cannot open %s\n", path);
+            return;
+        }
+        int32_t hdr[2] = {rows, cols};
+        fwrite(hdr, sizeof(int32_t), 2, f);
+        fwrite(data, sizeof(float), (size_t)rows * (size_t)cols, f);
+        fclose(f);
+        fprintf(stderr, "parakeet[dump]: wrote %s (%dx%d, %zu bytes)\n", path, rows, cols,
+                (size_t)rows * (size_t)cols * 4 + 8);
+    };
+    static bool dump_done = false;
+    const char* dump_prefix = getenv("PARAKEET_DUMP_PATH");
+    const bool do_dump = dump_prefix && *dump_prefix && !dump_done;
+    if (do_dump) {
+        std::string mp = std::string(dump_prefix) + "-mel.bin";
+        dump_f32(mp.c_str(), mel.data(), T_mel, (int)ctx->model.hparams.n_mels);
+    }
+
     // 2a. Optional one-shot encoder profile (lap-5 lever 1).
     // PARAKEET_PROFILE_ENC=1 dumps a per-layer/per-stage breakdown on the
     // first call only, then proceeds with the normal encode below.
@@ -2804,15 +2942,26 @@ extern "C" struct parakeet_result* parakeet_transcribe_ex(struct parakeet_contex
     }
 
     // 2. Encoder
+    // T_valid_enc mirrors NeMo's enc_len: floor(n_samples / hop) / subsampling
+    // (same formula NeMo uses to compute mel_len → enc_len). For 30 s @ 16 k
+    // and the standard hop=160 / subsampling=8 this is 375 (vs T_enc 376),
+    // and the encoder masks the last position out of attention + conv input.
     int T_enc = 0;
+    const int T_valid_mel = n_samples / (int)ctx->model.hparams.hop_length;
+    const int T_valid_enc = T_valid_mel / (int)ctx->model.hparams.subsampling_factor;
     auto _t_enc = clk::now();
-    auto enc = parakeet_encode_mel(ctx, mel.data(), (int)ctx->model.hparams.n_mels, T_mel, &T_enc);
+    auto enc = parakeet_encode_mel(ctx, mel.data(), (int)ctx->model.hparams.n_mels, T_mel, &T_enc, T_valid_enc);
     if (tim) {
         tim->t_encoder_ms = ms_since(_t_enc);
         tim->T_enc = T_enc;
     }
     if (enc.empty())
         return nullptr;
+    if (do_dump) {
+        std::string ep = std::string(dump_prefix) + "-enc.bin";
+        dump_f32(ep.c_str(), enc.data(), T_enc, (int)ctx->model.hparams.d_model);
+        dump_done = true;
+    }
     if (getenv("PARAKEET_DEBUG")) {
         fprintf(stderr, "parakeet: encoder OK (%d frames)\n", T_enc);
         int d = (int)ctx->model.hparams.d_model;
@@ -2913,11 +3062,24 @@ extern "C" struct parakeet_result* parakeet_transcribe_ex(struct parakeet_contex
     r->tokens = (parakeet_token_data*)calloc(r->n_tokens > 0 ? r->n_tokens : 1, sizeof(parakeet_token_data));
     std::string text;
     const int frame_dur_cs = (int)ctx->model.hparams.frame_dur_cs;
+    // Quality debug: PARAKEET_DUMP_TOKENS=1 prints id/piece/bytes for every
+    // emitted token, used to compare against python NeMo's y_sequence.
+    const bool dump_tokens = []() {
+        const char* e = getenv("PARAKEET_DUMP_TOKENS");
+        return e && *e && strcmp(e, "0") != 0;
+    }();
     for (int i = 0; i < r->n_tokens; i++) {
         const auto& e = emitted[i];
         const std::string& piece =
             (e.id >= 0 && e.id < (int)ctx->vocab.id_to_token.size()) ? ctx->vocab.id_to_token[e.id] : std::string("");
         std::string vis = spiece_to_text(piece);
+        if (dump_tokens) {
+            fprintf(stderr, "[tok %3d] id=%5d t=%d..%d p=%.3f piece='%s' bytes=", i, e.id, e.t_start, e.t_end, e.p,
+                    piece.c_str());
+            for (size_t b = 0; b < piece.size() && b < 8; b++)
+                fprintf(stderr, "%02x ", (unsigned char)piece[b]);
+            fprintf(stderr, "vis='%s'\n", vis.c_str());
+        }
 
         parakeet_token_data& td = r->tokens[i];
         td.id = e.id;
@@ -2961,7 +3123,7 @@ extern "C" struct parakeet_result* parakeet_transcribe_ex(struct parakeet_contex
         // Pure-punctuation detector. Recognises ASCII punct plus the
         // common CJK punctuation (。、？！「」『』・,) so JA tokens
         // like "、" attach to the previous word instead of forming their
-        // own subtitle entry.
+        // own subtitle entry. Defined before refinement so we can re-use it.
         auto is_punct_only = [](const char* s) {
             if (!s || !*s)
                 return false;
@@ -2988,6 +3150,26 @@ extern "C" struct parakeet_result* parakeet_transcribe_ex(struct parakeet_contex
             }
             return true;
         };
+
+        // Punct-token timestamp refinement (NeMo's _refine_timestamps_tdt).
+        // The TDT decoder often emits "." / "?" / "!" several frames AFTER
+        // the audible end of the preceding word — the model "saves" the
+        // punct prediction across silence. Without refinement, the period
+        // glued onto the previous word in word-grouping pulls word.t1
+        // hundreds of ms past the actual end of the spoken word, which
+        // shows up in readalong as the highlight lingering on the last
+        // word of a sentence.
+        //
+        // NeMo handles this by snapping each punct token's [start,end] to
+        // [prev.end, prev.end] before grouping. Mirror that here in place
+        // on r->tokens so the grouper's cur.t1 update naturally lands on
+        // the previous (non-punct) token's end.
+        for (int i = 1; i < r->n_tokens; i++) {
+            if (is_punct_only(r->tokens[i].text)) {
+                r->tokens[i].t0 = r->tokens[i - 1].t1;
+                r->tokens[i].t1 = r->tokens[i - 1].t1;
+            }
+        }
 
         // True end-of-sentence punct (for the gap-insertion pass below).
         auto ends_with_sentence_punct = [](const char* s) {
@@ -3025,11 +3207,22 @@ extern "C" struct parakeet_result* parakeet_transcribe_ex(struct parakeet_contex
             const auto& td = r->tokens[i];
             if (!td.text[0])
                 continue;
-            // Skip standalone space tokens (e.g. an initial " " BOS marker).
-            // Without this they leak through as empty word entries in
-            // no-space mode.
-            if (td.text[0] == ' ' && td.text[1] == '\0')
+            // A standalone "▁" piece (vis=" ") is a SentencePiece word boundary
+            // emitted as its own token — common between a word like "April" and
+            // a digit like "2" because the vocab has no "▁2" entry. It must
+            // flush the current word so the digit doesn't glue onto it
+            // ("April 2nd" not "April2nd"); but it carries no characters of its
+            // own so we don't start a new word from it.
+            if (td.text[0] == ' ' && td.text[1] == '\0') {
+                if (have_cur) {
+                    flush_cur();
+                    cur = {};
+                    cur_p_sum = 0.0f;
+                    cur_p_cnt = 0;
+                    have_cur = false;
+                }
                 continue;
+            }
 
             const bool has_leading_space = (td.text[0] == ' ');
             const bool is_punct = is_punct_only(td.text);
