@@ -1785,13 +1785,6 @@ static bool tdt_gpu_run_predictor(parakeet_context* ctx, int token_id) {
         ggml_init_params ip = {s.pred_meta.size(), s.pred_meta.data(), /*no_alloc=*/true};
         s.pred_meta_ctx = ggml_init(ip);
         s.pred_graph = parakeet_build_predictor_graph_into(ctx, s.pred_meta_ctx);
-        // Lap-6 lever D3: assign a stable nonzero uid so ggml_cuda_graph_update_required
-        // hits its fast-path early-return (ggml-cuda.cu:3141) on every call after the
-        // first. Without this, the per-call cost includes a full node-property memcmp
-        // walk (~5-15 µs at our op count). The uid only matters within this process,
-        // doesn't need to collide-with-anything-globally — pick a fixed nonzero per
-        // graph slot.
-        ggml_graph_set_uid(s.pred_graph, 0xC0DEC0DE00000001ULL);
     }
     gf = s.pred_graph ? s.pred_graph : parakeet_build_predictor_graph(ctx);
     return tdt_gpu_step_compute(ctx, gf, &ctx->pred_gallocr, "tdt_gpu predictor");
@@ -1811,8 +1804,6 @@ static bool tdt_gpu_run_joint(parakeet_context* ctx, const float* enc_t_data, in
         ggml_init_params ip = {s_jg.joint_meta.size(), s_jg.joint_meta.data(), /*no_alloc=*/true};
         s_jg.joint_meta_ctx = ggml_init(ip);
         s_jg.joint_graph = parakeet_build_joint_graph_into(ctx, s_jg.joint_meta_ctx);
-        // Lap-6 lever D3: same uid trick as the predictor — distinct constant.
-        ggml_graph_set_uid(s_jg.joint_graph, 0xC0DEC0DE00000002ULL);
     }
     gf = s_jg.joint_graph ? s_jg.joint_graph : parakeet_build_joint_graph(ctx);
     if (!tdt_gpu_step_compute(ctx, gf, &ctx->joint_gallocr, "tdt_gpu joint"))
