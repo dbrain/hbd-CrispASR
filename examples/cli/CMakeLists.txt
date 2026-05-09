@@ -50,6 +50,8 @@ add_executable(${TARGET}
     crispasr_run.cpp
     crispasr_server.cpp
     crispasr_tts_chunking.cpp
+    crispasr_worker_ipc.cpp
+    crispasr_worker_session.cpp
 )
 
 # ---------------------------------------------------------------------------

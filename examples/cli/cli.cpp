@@ -11,6 +11,7 @@
 #include "crispasr_output.h"  // crispasr_make_disp_segments — split-on-punct (#29)
 #include "crispasr_server.h"  // crispasr_run_server()
 #include "crispasr_vad_cli.h" // crispasr_resolve_vad_model — auto-DL silero (#33)
+#include "crispasr_worker_session.h" // run_worker_loop() — `--worker <fd>` subprocess mode
 
 #include <cmath>
 #include <algorithm>
@@ -1501,6 +1502,21 @@ int main(int argc, char** argv) {
     // non-ASCII characters to the console, and access files with non-ASCII paths.
     SetConsoleOutputCP(CP_UTF8);
 #endif
+
+    // Worker subprocess mode: when `--worker <fd>` is the first flag (set
+    // by spawn_worker() in the parent), this process role flips from HTTP
+    // server to worker dispatch loop. The fd is the worker end of a Unix
+    // socketpair; the parent never touches GPU, the worker owns the CUDA
+    // primary context, and parent's /unload SIGKILLs us to reclaim VRAM
+    // cleanly. We branch BEFORE arg parsing / banner / ggml_backend_load_all
+    // so the worker's startup matches what the parent expects (HELLO frame
+    // first, no spurious stdout).
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::string(argv[i]) == "--worker") {
+            int fd = std::atoi(argv[i + 1]);
+            return crispasr::run_worker_loop(fd);
+        }
+    }
 
     whisper_params params;
 

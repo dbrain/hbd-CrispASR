@@ -29,6 +29,7 @@
 #include "common-crispasr.h" // read_audio_data
 #include "crispasr_tts_chunking.h"
 #include "crispasr_wav_writer.h"
+#include "crispasr_worker_session.h" // PARAKEET_WORKER_ISOLATION subprocess model
 #include "../server/httplib.h"
 #include "../json.hpp"
 
@@ -268,9 +269,14 @@ static bool check_cancel(const std::string& cancel_url) {
 // preempted=true and returns whatever has transcribed so far. Useful when
 // a higher-priority GPU consumer (TTS, vision) preempts the STT job and we
 // don't want to discard partial work.
+//
+// Exactly one of `backend` / `worker` is set. `worker`-mode forwards the
+// transcribe call over IPC to a subprocess that owns the CUDA context;
+// the chunking + cancel polling stays here so /unload (SIGKILL of the
+// worker) reclaims VRAM the same way regardless of mode.
 static transcription_result do_transcribe(const std::string& audio_path, CrispasrBackend* backend,
-                                          std::mutex& model_mutex, const whisper_params& rp,
-                                          const std::string& cancel_url) {
+                                          crispasr::WorkerSession* worker, std::mutex& model_mutex,
+                                          const whisper_params& rp, const std::string& cancel_url) {
     transcription_result result;
     result.language = rp.language;
 
@@ -303,6 +309,18 @@ static transcription_result do_transcribe(const std::string& audio_path, Crispas
     const int max_chunk_samples = rp.chunk_seconds * SR; // default 30s = 480000
     const int n_samples = (int)pcmf32.size();
 
+    // run_one returns segments + a worker-died flag. In worker mode, after
+    // each call we sample worker->is_alive() to distinguish "real empty
+    // result" (silent chunk) from "worker died and the call returned {}".
+    // Without this distinction the chunked path used to silently swallow
+    // worker death and return a partial transcript flagged ok=true.
+    auto run_one = [&](const float* p, int n, int64_t t_off_cs, bool* worker_died) {
+        std::vector<crispasr_segment> segs =
+            worker ? worker->transcribe(p, n, t_off_cs, rp) : backend->transcribe(p, n, t_off_cs, rp);
+        *worker_died = worker && !worker->is_alive();
+        return segs;
+    };
+
     {
         std::lock_guard<std::mutex> lock(model_mutex);
         auto t0 = std::chrono::steady_clock::now();
@@ -334,11 +352,17 @@ static transcription_result do_transcribe(const std::string& audio_path, Crispas
         }
         result.language = rp.language;
 
+        bool worker_died = false;
         if (n_samples <= max_chunk_samples) {
             // Short audio — single pass; no cancel checkpoint mid-chunk
             // (the encoder owns the GPU for the duration of one transcribe
             // call and there's no cooperative preemption inside it).
-            result.segs = backend->transcribe(pcmf32.data(), n_samples, 0, rp);
+            result.segs = run_one(pcmf32.data(), n_samples, 0, &worker_died);
+            if (worker_died) {
+                result.error = "worker died mid-transcribe: " + worker->last_error();
+                result.elapsed_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                return result;
+            }
         } else {
             // Chunk long audio into fixed segments. Between chunks we yield
             // control long enough to poll cancel_url; if koblem signals
@@ -357,13 +381,19 @@ static transcription_result do_transcribe(const std::string& audio_path, Crispas
                 int chunk_len = std::min(max_chunk_samples, n_samples - offset);
                 int64_t t_offset_cs = (int64_t)((double)offset / SR * 100.0);
                 auto tc0 = std::chrono::steady_clock::now();
-                auto chunk_segs = backend->transcribe(pcmf32.data() + offset, chunk_len, t_offset_cs, rp);
+                auto chunk_segs = run_one(pcmf32.data() + offset, chunk_len, t_offset_cs, &worker_died);
                 auto tc1 = std::chrono::steady_clock::now();
                 double chunk_s = std::chrono::duration<double>(tc1 - tc0).count();
                 result.segs.insert(result.segs.end(), chunk_segs.begin(), chunk_segs.end());
                 chunk_idx++;
-                fprintf(stderr, "crispasr-server: chunk %d/%d done (%.1fs audio in %.1fs)\n", chunk_idx, n_chunks,
-                        chunk_len / (double)SR, chunk_s);
+                fprintf(stderr, "crispasr-server: chunk %d/%d done (%.1fs audio in %.1fs)%s\n", chunk_idx, n_chunks,
+                        chunk_len / (double)SR, chunk_s, worker_died ? " [WORKER DIED]" : "");
+                if (worker_died) {
+                    result.error = "worker died at chunk " + std::to_string(chunk_idx) + "/" +
+                                   std::to_string(n_chunks) + ": " + worker->last_error();
+                    result.elapsed_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                    return result;
+                }
             }
         }
 
@@ -400,6 +430,45 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     std::atomic<bool> model_loaded{false};
     std::atomic<int64_t> last_request_ms{0};
     std::string backend_name = params.backend;
+
+    // Worker-isolation: when PARAKEET_WORKER_ISOLATION=1, the parent process
+    // never touches CUDA. A subprocess holds the model + ggml-cuda primary
+    // context; on /unload we SIGKILL it and the entire context (cuBLAS
+    // workspace, cubin/PTX cache, driver state) goes with it — that's the
+    // only way to return nvidia-smi to the pre-load floor without exiting
+    // the parent. Mirrors qwen3-tts.cpp QWEN3_TTS_WORKER_ISOLATION semantics.
+    std::unique_ptr<crispasr::WorkerSession> worker;
+    bool worker_iso = false;
+    if (const char* env = std::getenv("PARAKEET_WORKER_ISOLATION")) {
+        worker_iso = env[0] && env[0] != '0';
+    }
+    // Forward CLI args (sans `--worker`) so the child sees the same model /
+    // backend / -t / etc. options. Note: the parent's argv isn't visible
+    // here; the child re-runs cli.cpp main() and re-parses these. We can't
+    // round-trip every CLI flag without argv, so the worker leans entirely
+    // on LOAD_REQ params for its config — extra_argv is empty. The worker
+    // mode in cli.cpp branches before whisper_params_parse, so flags we
+    // don't propagate are simply skipped (params come over LOAD_REQ).
+    std::vector<std::string> worker_extra_argv;
+    if (worker_iso) {
+        // argv[0] for the spawn must point at the running binary on disk.
+        // /proc/self/exe is the canonical Linux source; readlink at runtime
+        // because $0 / argv[0] aren't reliable when invoked through a
+        // shell wrapper (Dockerfile uses `/bin/sh -c "exec /usr/local/bin/crispasr ..."`).
+        char self_path[4096] = {0};
+        ssize_t n = -1;
+#if !defined(_WIN32)
+        n = ::readlink("/proc/self/exe", self_path, sizeof(self_path) - 1);
+#endif
+        if (n <= 0) {
+            // Fallback: hard-code the docker entrypoint path. If it doesn't
+            // exist the worker fails-soft on next /inference (no isolation).
+            std::strncpy(self_path, "/usr/local/bin/crispasr", sizeof(self_path) - 1);
+        }
+        worker = std::make_unique<crispasr::WorkerSession>(self_path, worker_extra_argv);
+        fprintf(stderr, "crispasr-server: PARAKEET_WORKER_ISOLATION=1 — model loads in subprocess (argv0=%s)\n",
+                self_path);
+    }
 
     // Ecosystem env knobs — keep load semantics matching the python parakeet-stt
     // service (kobbler/docker/parakeet-stt/) so koblem's GPU gate sees the same
@@ -451,12 +520,41 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         return true;
     };
 
+    auto build_worker_cfg = [&]() {
+        crispasr::WorkerLoadConfig cfg;
+        cfg.backend = backend_name;
+        cfg.model = params.model;
+        cfg.model_quant = params.model_quant;
+        cfg.verbose = params.verbose;
+        cfg.use_gpu = params.use_gpu;
+        cfg.gpu_device = params.gpu_device;
+        cfg.flash_attn = params.flash_attn;
+        cfg.init_params = params;
+        return cfg;
+    };
+
     // Materialize the backend (allocates GPU memory). Caller holds model_mutex.
     // Builds a fresh backend before dropping any existing one so a failed
     // load on hot-swap leaves the prior model in place. The `ready` flag
     // is only flipped during the brief window where backend is being
     // assigned; new requests block on model_mutex through that window.
+    //
+    // In worker-isolation mode this path runs ensure_loaded() on the worker
+    // session, which spawns the subprocess (or kills+respawns if cfg
+    // changed) and sends LOAD_REQ. The parent stays CUDA-free.
     auto load_backend_locked = [&]() -> bool {
+        if (worker) {
+            ready.store(false);
+            if (!worker->ensure_loaded(build_worker_cfg())) {
+                fprintf(stderr, "crispasr-server: worker LOAD_REQ failed: %s\n", worker->last_error().c_str());
+                return false;
+            }
+            model_loaded.store(true);
+            ready.store(true);
+            fprintf(stderr, "crispasr-server: worker pid=%d loaded backend '%s', model '%s'\n", (int)worker->pid(),
+                    worker->backend_name().c_str(), params.model.c_str());
+            return true;
+        }
         auto nb = crispasr_create_backend(backend_name);
         if (!nb || !nb->init(params)) {
             fprintf(stderr, "crispasr-server: failed to init backend '%s'\n", backend_name.c_str());
@@ -472,16 +570,24 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     };
 
     // Tear down the backend and free GPU memory. Caller holds model_mutex.
-    // CrispasrBackend's dtor calls shutdown() which calls parakeet_free()
-    // (or the backend equivalent), which releases CUDA allocations. We
-    // verify in the baseline harness that this returns nvidia-smi to the
-    // pre-load floor; if it doesn't, we'll switch to subprocess isolation
-    // like the python service does.
+    //
+    // - In-process mode: CrispasrBackend's dtor calls shutdown() / the
+    //   backend's free routine, releasing the explicit CUDA allocations.
+    //   The CUDA primary context (cuBLAS workspace, cubin/PTX cache, driver
+    //   runtime state — 100-400 MiB) sticks until this process exits;
+    //   that's the residual visible on nvidia-smi after /unload.
+    // - Worker-isolation mode: SIGKILL the subprocess. The kernel reaps
+    //   the entire CUDA context with the process; nvidia-smi returns to
+    //   the pre-load floor instantly.
     auto free_backend_locked = [&]() {
         ready.store(false);
-        backend.reset();
+        if (worker) {
+            worker->shutdown();
+        } else {
+            backend.reset();
+        }
         model_loaded.store(false);
-        fprintf(stderr, "crispasr-server: backend unloaded\n");
+        fprintf(stderr, "crispasr-server: backend unloaded%s\n", worker ? " (worker SIGKILLed)" : "");
     };
 
     if (!resolve_model_into_params(params, backend_name))
@@ -503,18 +609,30 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
 
     // Ensure backend is loaded (lazy path). Returns true if ready to serve.
     // Sets a 503 on `res` and returns false on failure so callers can early-out.
+    //
+    // Worker mode caveat: model_loaded is a parent-side hint; if the worker
+    // dies out-of-band (SIGKILL, SEGV, OOM) the hint stays true. So in
+    // worker mode we additionally check worker->is_alive() (which actively
+    // reaps a dead child) and force a respawn. Without this, the next
+    // request would dispatch to a stale fd and silently return empty.
     auto ensure_loaded = [&](Response& res) -> bool {
-        if (model_loaded.load() && ready.load())
+        const bool worker_dead = worker && !worker->is_alive();
+        if (model_loaded.load() && ready.load() && !worker_dead)
             return true;
-        if (!lazy_load) {
+        if (!lazy_load && !worker_dead) {
             // Non-lazy server: model is genuinely still loading or failed.
             json_error(res, 503, "model is still loading");
             return false;
         }
         std::lock_guard<std::mutex> lock(model_mutex);
-        // Re-check under lock — another request may have loaded it.
-        if (model_loaded.load() && ready.load())
+        // Re-check under lock — another request may have respawned.
+        if (model_loaded.load() && ready.load() && (!worker || worker->is_alive()))
             return true;
+        if (worker && !worker->is_alive()) {
+            // Force a clean respawn: model_loaded is stale.
+            model_loaded.store(false);
+            ready.store(false);
+        }
         if (!load_backend_locked()) {
             json_error(res, 503, "failed to load model");
             return false;
@@ -592,7 +710,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         rp.language = form_string(req, "language", rp.language);
 
         const std::string cancel_url = form_string(req, "cancel_url");
-        auto result = do_transcribe(audio_path, backend.get(), model_mutex, rp, cancel_url);
+        auto result = do_transcribe(audio_path, backend.get(), worker.get(), model_mutex, rp, cancel_url);
         if (tmp_owned)
             std::remove(audio_path.c_str());
 
@@ -694,7 +812,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         if (!prompt.empty())
             rp.prompt = prompt;
 
-        auto result = do_transcribe(audio_path, backend.get(), model_mutex, rp, cancel_url);
+        auto result = do_transcribe(audio_path, backend.get(), worker.get(), model_mutex, rp, cancel_url);
         if (tmp_owned)
             std::remove(audio_path.c_str());
 
@@ -814,13 +932,24 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     // model_loaded=false until the first request triggers load.
     // -----------------------------------------------------------------------
     svr.Get("/health", [&](const Request&, Response& res) {
-        const bool loaded = model_loaded.load();
+        // In worker mode, the authoritative liveness signal is the worker
+        // process itself — model_loaded is a parent-side hint that gets
+        // stale if the worker dies out-of-band. Probing worker->is_alive()
+        // here actively reaps a dead child so /health stops lying about
+        // model_loaded after a crash.
+        bool loaded = model_loaded.load();
+        if (worker && !worker->is_alive())
+            loaded = false;
         const bool serving = ready.load() || lazy_load;
         std::ostringstream js;
         js << "{\"status\": \"" << (serving ? "ok" : "loading") << "\"";
         js << ", \"model_loaded\": " << (loaded ? "true" : "false");
         js << ", \"backend\": \"" << crispasr_json_escape(backend_name) << "\"";
         js << ", \"model\": \"" << crispasr_json_escape(params.model) << "\"";
+        if (worker) {
+            js << ", \"worker_isolation\": true";
+            js << ", \"worker_pid\": " << (worker->is_alive() ? (int)worker->pid() : 0);
+        }
         js << "}";
         if (!serving)
             res.status = 503;
@@ -912,7 +1041,9 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         touch_last_request();
         if (!ensure_loaded(res))
             return;
-        if (!backend || !(backend->capabilities() & CAP_TTS)) {
+        const uint32_t active_caps = worker ? worker->capabilities() : (backend ? backend->capabilities() : 0u);
+        const bool have_active = worker ? worker->is_alive() : (backend != nullptr);
+        if (!have_active || !(active_caps & CAP_TTS)) {
             json_error(res, 400,
                        "loaded backend '" + backend_name +
                            "' does not support TTS (no CAP_TTS); load a TTS backend "
@@ -997,7 +1128,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         {
             std::lock_guard<std::mutex> lock(model_mutex);
             for (const auto& sent : sentences) {
-                std::vector<float> chunk = backend->synthesize(sent, rp);
+                std::vector<float> chunk = worker ? worker->synthesize(sent, rp) : backend->synthesize(sent, rp);
                 if (!chunk.empty())
                     chunks.push_back(std::move(chunk));
             }
@@ -1063,11 +1194,13 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     svr.Get("/v1/voices", [&](const Request& req, Response& res) {
         if (!require_auth(req, res))
             return;
-        if (!model_loaded.load() || !backend) {
+        const bool have_active = worker ? worker->is_alive() : (backend != nullptr);
+        if (!model_loaded.load() || !have_active) {
             json_error(res, 503, "no model loaded");
             return;
         }
-        if (!(backend->capabilities() & CAP_TTS)) {
+        const uint32_t active_caps = worker ? worker->capabilities() : backend->capabilities();
+        if (!(active_caps & CAP_TTS)) {
             json_error(res, 400,
                        "loaded backend '" + backend_name +
                            "' does not support TTS (no CAP_TTS); load a TTS backend "
@@ -1119,10 +1252,12 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
 
     // Start
     // -----------------------------------------------------------------------
-    // backend may be null in lazy mode; gate the TTS-banner on whether we
-    // actually have a loaded backend, otherwise just suppress the TTS lines
-    // until the first /load (which can swap to a TTS backend at runtime).
-    const bool tts = (backend && (backend->capabilities() & CAP_TTS) != 0);
+    // backend (or worker) may be null in lazy mode; gate the TTS-banner on
+    // whether we actually have a loaded backend, otherwise just suppress
+    // the TTS lines until the first /load (which can swap to a TTS backend
+    // at runtime).
+    const uint32_t boot_caps = worker ? worker->capabilities() : (backend ? backend->capabilities() : 0u);
+    const bool tts = (boot_caps & CAP_TTS) != 0;
     fprintf(stderr, "\ncrispasr-server: listening on %s:%d\n", host.c_str(), port);
     fprintf(stderr, "  POST /inference                  — upload audio (native JSON)\n");
     fprintf(stderr, "  POST /v1/audio/transcriptions    — OpenAI-compatible API\n");
@@ -1144,6 +1279,8 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     fprintf(stderr, "\n");
     if (!api_keys.empty())
         fprintf(stderr, "crispasr-server: API key authentication enabled\n");
+    if (worker)
+        fprintf(stderr, "crispasr-server: worker-isolation enabled (subprocess holds GPU; /unload SIGKILLs it)\n");
     if (lazy_load)
         fprintf(stderr, "crispasr-server: lazy-load enabled (model loads on first request)\n");
     if (idle_unload_seconds > 0)
