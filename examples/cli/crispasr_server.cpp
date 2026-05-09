@@ -276,7 +276,7 @@ static bool check_cancel(const std::string& cancel_url) {
 // worker) reclaims VRAM the same way regardless of mode.
 static transcription_result do_transcribe(const std::string& audio_path, CrispasrBackend* backend,
                                           crispasr::WorkerSession* worker, std::mutex& model_mutex,
-                                          const whisper_params& rp, const std::string& cancel_url) {
+                                          whisper_params rp, const std::string& cancel_url) {
     transcription_result result;
     result.language = rp.language;
 
@@ -297,10 +297,6 @@ static transcription_result do_transcribe(const std::string& audio_path, Crispas
     }
 
     result.duration_s = (double)pcmf32.size() / 16000.0;
-
-    const bool want_auto_lang = rp.detect_language || rp.language == "auto";
-    const bool has_native_lid = (backend->capabilities() & CAP_LANGUAGE_DETECT) != 0;
-    const bool lid_disabled = rp.lid_backend == "off" || rp.lid_backend == "none";
 
     // Auto-chunk long audio to prevent OOM (#27).
     // Most backends have O(T²) attention in the encoder — 30s chunks keep
@@ -324,33 +320,6 @@ static transcription_result do_transcribe(const std::string& audio_path, Crispas
     {
         std::lock_guard<std::mutex> lock(model_mutex);
         auto t0 = std::chrono::steady_clock::now();
-
-        // Match file-mode `-l auto`: run LID once per uploaded audio sample
-        // before dispatching chunks to backends that need explicit language.
-        if (want_auto_lang && !has_native_lid && !lid_disabled) {
-            crispasr_lid_result lid;
-            if (crispasr_detect_language_cli(pcmf32.data(), (int)pcmf32.size(), rp, lid)) {
-                rp.language = lid.lang_code;
-                if (rp.source_lang.empty() || rp.source_lang == "auto")
-                    rp.source_lang = lid.lang_code;
-                if (!rp.no_prints) {
-                    fprintf(stderr, "crispasr-server: LID -> language = '%s' (%s, p=%.3f)\n", lid.lang_code.c_str(),
-                            lid.source.c_str(), lid.confidence);
-                }
-            } else if (rp.language == "auto") {
-                if (!rp.no_prints) {
-                    fprintf(stderr, "crispasr-server: LID failed and no -l was set — "
-                                    "defaulting to 'en'. Pass `-l <code>` or a request language field to override.\n");
-                }
-                rp.language = "en";
-                if (rp.source_lang.empty() || rp.source_lang == "auto")
-                    rp.source_lang = "en";
-            } else if (!rp.no_prints) {
-                fprintf(stderr, "crispasr-server: LID failed, falling back to language='%s'\n", rp.language.c_str());
-            }
-            crispasr_lid_free_cache();
-        }
-        result.language = rp.language;
 
         bool worker_died = false;
         if (n_samples <= max_chunk_samples) {
