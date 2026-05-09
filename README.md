@@ -1,4 +1,31 @@
-# CrispASR
+# hbd-CrispASR - The "I only care about Parakeet on this one device" edition
+
+> Here be dragons 🐲  
+> ⚠️ PSAs/TLDRs from the potato that told Claude to see if we could make parakeet friendlier to run after poking at [dbrain/hbd-qwen3-tts.cpp](https://github.com/dbrain/hbd-qwen3-tts.cpp) which is a fork of a fork I also potatoed
+> - LLM generated noise - I'm a software engineer but I won't pretend to know anything about this space.
+> - Entirely tested and targetted at my hardware (RTX 3060 12GB, AMD misc), may explode on anything else or run slower. Likely any CUDA device would benefit but I'm no nvidiaologist, 0 attention paid outside of "works for me".
+> - Goal was to get off python, found this project but it was a fair bit slower than python somehow, let Claude have a crack on the back of the qwen3-tts work
+> - Rest of the README.md is Claude pretending I'm a real human
+>
+> Features vs CrispASR
+> - Adds unload/load endpoints 0ing VRAM between usage as well as lazy unload
+> - Dumber repository name
+>
+> Performance at time of writing
+> 
+>   | Engine | Quant | Mean RTF | VRAM peak | TTFT cold | TTFT warm |
+>   |---|---|---:|---:|---:|---:|
+>   | Python NeMo (patched, prod) | fp16 | 136.5× | 1913 MiB | 29.5 s | 0.23 s |
+>   | Upstream CrispASR (32f450d) | q4_k | 23.5× | 1032 MiB |  | 1.44 s |
+>   | Upstream CrispASR (32f450d) | q8_0 | 24.0× | 1284 MiB |  | 1.43 s |
+>   | Upstream CrispASR (32f450d) | f16 | 24.0× | 1772 MiB |  | 1.44 s |
+>   | **HBD** | **q4_k** | **308.6×** | **1103 MiB** | **0.48 s** | **0.12 s** |
+>   | **HBD** | **q8_0** | **317.3×** | **1355 MiB** | **0.51 s** | **0.11 s** |
+>   | **HBD** | **f16** | **290.4×** | **1829 MiB** | **0.60 s** | **0.12 s** |
+>
+> So 2x~ python with my hacks (... mostly just VRAM related from memory), 12x~ upstream.
+> Entirely possible these tests were unfair somehow or not producible on other hardware, but consistent over runs for me and this whole "hbd-" project run is all "make it work betterer for me".
+>
 
 **One C++ binary, twenty-four ASR backends + five TTS engines + multilingual text translation, zero Python dependencies.**
 
