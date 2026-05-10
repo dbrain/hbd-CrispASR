@@ -615,12 +615,23 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     // /v1/* endpoints from a different origin need:
     //   1. Access-Control-Allow-Origin on every response (set on each route)
     //   2. A 204 reply to OPTIONS preflights with Allow-{Methods,Headers}
-    // The pre-routing handler runs on every request before route dispatch;
-    // we use it to attach the response headers and short-circuit the
-    // OPTIONS preflight without touching individual routes.
-    if (!params.server_cors_origin.empty()) {
-        const std::string cors_origin = params.server_cors_origin;
-        svr.set_pre_routing_handler([cors_origin](const Request& req, Response& res) {
+    // The pre-routing handler runs on every request before route dispatch:
+    //   1) Inject Content-Length: 0 on body-less POST/PUT/PATCH so the
+    //      body-read loop in cpp-httplib v0.20 doesn't deadlock for 5s
+    //      (read_content_without_length spins on strm.read() until the
+    //      keep-alive timeout drops the connection, then returns 400).
+    //      /unload, /load, and other admin endpoints are body-less by
+    //      design — internal callers (koblem, curl without -d) hit this.
+    //   2) Apply CORS headers + short-circuit OPTIONS preflight when
+    //      CORS is enabled.
+    const std::string cors_origin = params.server_cors_origin;
+    svr.set_pre_routing_handler([cors_origin](const Request& req, Response& res) {
+        if ((req.method == "POST" || req.method == "PUT" || req.method == "PATCH") &&
+            !req.has_header("Content-Length") &&
+            req.get_header_value("Transfer-Encoding") != "chunked") {
+            const_cast<Request&>(req).set_header("Content-Length", "0");
+        }
+        if (!cors_origin.empty()) {
             res.set_header("Access-Control-Allow-Origin", cors_origin);
             res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
             res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key");
@@ -629,8 +640,10 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
                 res.status = 204;
                 return Server::HandlerResponse::Handled;
             }
-            return Server::HandlerResponse::Unhandled;
-        });
+        }
+        return Server::HandlerResponse::Unhandled;
+    });
+    if (!cors_origin.empty()) {
         fprintf(stderr, "crispasr-server: CORS enabled (Allow-Origin: %s)\n", cors_origin.c_str());
     }
 
