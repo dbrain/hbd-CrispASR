@@ -92,8 +92,9 @@ struct wave_hdr {
 } __attribute__((__packed__));
 
 struct audio_buffer {
-	u8 *ptr;
-	int size; /* size left in the buffer */
+	u8 *base;     /* start of the in-memory file */
+	s64 total;    /* total size in bytes */
+	s64 pos;      /* current read position */
 };
 
 static void set_wave_hdr(wave_hdr& wh, size_t size) {
@@ -138,14 +139,46 @@ static int read_packet(void *opaque, u8 *buf, int buf_size)
 {
     struct audio_buffer *audio_buf = (audio_buffer*)opaque;
 
-	buf_size = FFMIN(buf_size, audio_buf->size);
+	s64 remaining = audio_buf->total - audio_buf->pos;
+	if (remaining <= 0)
+		return AVERROR_EOF; /* signal real EOF; returning 0 makes some
+		                     * demuxers (mp3) spin forever */
 
-	/* copy internal buffer data to buf */
-	memcpy(buf, audio_buf->ptr, buf_size);
-	audio_buf->ptr += buf_size;
-	audio_buf->size -= buf_size;
+	int n = (int)FFMIN((s64)buf_size, remaining);
+	memcpy(buf, audio_buf->base + audio_buf->pos, n);
+	audio_buf->pos += n;
 
-	return buf_size;
+	return n;
+}
+
+/*
+ * Seek callback for the in-memory AVIO context. Without this, containers
+ * whose index lives at the end of the file (mov/mp4/m4a/m4b with moov-at-end,
+ * e.g. most audiobooks) cannot be parsed — the demuxer logs "partial file"
+ * and then reads bogus packet offsets, which corrupts the decode buffers
+ * downstream (free(): invalid pointer). The whole file is already mmap'd in
+ * memory, so seeking is just repositioning an offset.
+ */
+static s64 seek_packet(void *opaque, s64 offset, int whence)
+{
+    struct audio_buffer *audio_buf = (audio_buffer*)opaque;
+
+	whence &= ~AVSEEK_FORCE; /* libav may OR this in; it's advisory only */
+
+	switch (whence) {
+	case SEEK_SET:     audio_buf->pos = offset;                    break;
+	case SEEK_CUR:     audio_buf->pos += offset;                   break;
+	case SEEK_END:     audio_buf->pos = audio_buf->total + offset; break;
+	case AVSEEK_SIZE:  return audio_buf->total;
+	default:           return -1;
+	}
+
+	if (audio_buf->pos < 0)
+		audio_buf->pos = 0;
+	if (audio_buf->pos > audio_buf->total)
+		audio_buf->pos = audio_buf->total;
+
+	return audio_buf->pos;
 }
 
 static void convert_frame(struct SwrContext *swr, AVCodecContext *codec,
@@ -156,10 +189,15 @@ static void convert_frame(struct SwrContext *swr, AVCodecContext *codec,
 	u8 *buffer;
 
 	delay = swr_get_delay(swr, codec->sample_rate);
-	nr_samples = av_rescale_rnd(delay + frame->nb_samples,
+	/* In flush mode `frame` may be empty/invalid, so never read it. */
+	nr_samples = av_rescale_rnd(delay + (flush ? 0 : frame->nb_samples),
 				    WAVE_SAMPLE_RATE, codec->sample_rate,
 				    AV_ROUND_UP);
-	av_samples_alloc(&buffer, NULL, 1, nr_samples, AV_SAMPLE_FMT_S16, 0);
+	if (nr_samples <= 0)
+		return; /* nothing to convert — never alloc/copy 0 or garbage */
+
+	if (av_samples_alloc(&buffer, NULL, 1, nr_samples, AV_SAMPLE_FMT_S16, 0) < 0)
+		return;
 
 	/*
 	 * !flush is used to check if we are flushing any remaining
@@ -169,9 +207,14 @@ static void convert_frame(struct SwrContext *swr, AVCodecContext *codec,
 				 !flush ? (const u8 **)frame->data : NULL,
 				 !flush ? frame->nb_samples : 0);
 
-    *data = (s16*)realloc(*data, (*size + nr_samples) * sizeof(s16));
-	memcpy(*data + *size, buffer, nr_samples * sizeof(s16));
-	*size += nr_samples;
+	if (nr_samples > 0) {
+		s16 *grown = (s16*)realloc(*data, (*size + nr_samples) * sizeof(s16));
+		if (grown) {
+			*data = grown;
+			memcpy(*data + *size, buffer, nr_samples * sizeof(s16));
+			*size += nr_samples;
+		}
+	}
 	av_freep(&buffer);
 }
 
@@ -189,7 +232,7 @@ static bool is_audio_stream(const AVStream *stream)
 // size: size of output data
 static int decode_audio(struct audio_buffer *audio_buf, s16 **data, int *size)
 {
-    LOG("decode_audio: input size: %d\n", audio_buf->size);
+    LOG("decode_audio: input size: %lld\n", (long long)audio_buf->total);
 	AVFormatContext *fmt_ctx;
 	AVIOContext *avio_ctx;
 	AVStream *stream;
@@ -207,7 +250,7 @@ static int decode_audio(struct audio_buffer *audio_buf, s16 **data, int *size)
     fmt_ctx = avformat_alloc_context();
     avio_ctx_buffer = (u8*)av_malloc(AVIO_CTX_BUF_SZ);
     LOG("Creating an avio context: AVIO_CTX_BUF_SZ=%d\n", AVIO_CTX_BUF_SZ);
-    avio_ctx = avio_alloc_context(avio_ctx_buffer, AVIO_CTX_BUF_SZ, 0, audio_buf, &read_packet, NULL, NULL);
+    avio_ctx = avio_alloc_context(avio_ctx_buffer, AVIO_CTX_BUF_SZ, 0, audio_buf, &read_packet, NULL, &seek_packet);
 	fmt_ctx->pb = avio_ctx;
 
     // open the input stream and read header
@@ -294,13 +337,18 @@ static int decode_audio(struct audio_buffer *audio_buf, s16 **data, int *size)
 	*data = NULL;
 	*size = 0;
 	while (av_read_frame(fmt_ctx, packet) >= 0) {
-		avcodec_send_packet(codec, packet);
-
-		err = avcodec_receive_frame(codec, frame);
-		if (err == AVERROR(EAGAIN))
-			continue;
-
-		convert_frame(swr, codec, frame, data, size, false);
+		/* Only feed packets from the chosen audio stream to the decoder.
+		 * Container side-streams (cover art, chapters, timed metadata)
+		 * would otherwise be decoded as audio and yield garbage. */
+		if (packet->stream_index == stream_index &&
+		    avcodec_send_packet(codec, packet) == 0) {
+			/* A packet can yield more than one frame; drain them all.
+			 * Only convert frames the decoder actually produced —
+			 * never on EAGAIN or a decode error. */
+			while (avcodec_receive_frame(codec, frame) == 0)
+				convert_frame(swr, codec, frame, data, size, false);
+		}
+		av_packet_unref(packet);
 	}
 	/* Flush any remaining conversion buffers... */
 	convert_frame(swr, codec, frame, data, size, true);
@@ -341,8 +389,9 @@ int ffmpeg_decode_audio(const std::string &ifname, std::vector<uint8_t>& owav_da
     }
     LOG("Mapped input file: %s size: %d\n", ibuf, (int) ibuf_size);
     struct audio_buffer inaudio_buf;
-    inaudio_buf.ptr = ibuf;
-    inaudio_buf.size = ibuf_size;
+    inaudio_buf.base  = ibuf;
+    inaudio_buf.total = (s64) ibuf_size;
+    inaudio_buf.pos   = 0;
 
     s16 *odata=NULL;
     int osize=0;
@@ -351,18 +400,28 @@ int ffmpeg_decode_audio(const std::string &ifname, std::vector<uint8_t>& owav_da
     LOG("decode_audio returned %d \n", err);
     if (err != 0) {
         LOG("decode_audio failed\n");
+        free(odata);
         return err;
     }
     LOG("decode_audio output size: %d\n", osize);
 
+    if (osize <= 0) {
+        // No decodable audio (corrupt/truncated container) — fail cleanly so
+        // the caller can fall back instead of emitting a header-only WAV.
+        LOG("decode_audio produced no samples\n");
+        free(odata);
+        return -1;
+    }
+
     wave_hdr wh;
-    const size_t outdatasize = osize * sizeof(s16);
+    const size_t outdatasize = (size_t) osize * sizeof(s16);
     set_wave_hdr(wh, outdatasize);
     owav_data.resize(sizeof(wave_hdr) + outdatasize);
     // header:
     memcpy(owav_data.data(), &wh, sizeof(wave_hdr));
     // the data:
-    memcpy(owav_data.data() + sizeof(wave_hdr), odata, osize* sizeof(s16));
+    memcpy(owav_data.data() + sizeof(wave_hdr), odata, outdatasize);
 
+    free(odata);
     return 0;
 }

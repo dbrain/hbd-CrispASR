@@ -96,8 +96,9 @@ bool read_audio_data(const std::string & fname, std::vector<float>& pcmf32, std:
         if (!dot) return false;
         std::string ext = dot;
         for (auto& c : ext) c = (char)tolower((unsigned char)c);
-        return ext == ".mp3" || ext == ".m4a" || ext == ".mp4" || ext == ".aac"
-            || ext == ".opus" || ext == ".ogg" || ext == ".oga" || ext == ".webm";
+        return ext == ".mp3" || ext == ".m4a" || ext == ".m4b" || ext == ".mp4"
+            || ext == ".aac" || ext == ".opus" || ext == ".ogg" || ext == ".oga"
+            || ext == ".webm";
     };
 
     bool decoder_ready = false;
