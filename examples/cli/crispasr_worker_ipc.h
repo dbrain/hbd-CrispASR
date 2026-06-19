@@ -126,6 +126,7 @@ bool unpack_stereo_payload(const std::vector<uint8_t>& payload, std::string* out
 // load-time arguments (-m, --backend, --auto-download, etc.) it would
 // have seen if invoked directly. Returns the child pid on success and
 // writes the parent-side fd to `*out_parent_fd`. Returns -1 on failure.
-pid_t spawn_worker(const char* self_argv0, const std::vector<std::string>& extra_argv, int* out_parent_fd);
+pid_t spawn_worker(const char* self_argv0, const std::vector<std::string>& extra_argv, int* out_parent_fd,
+                   const std::string& cuda_visible_devices = "");
 
 } // namespace crispasr

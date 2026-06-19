@@ -522,16 +522,23 @@ bool WorkerSession::ensure_loaded(const WorkerLoadConfig& cfg) {
     // backend + model + the few load-time GPU-affecting flags. Per-call
     // overrides (language/temperature/etc.) ride along in the request
     // params, so they don't gate the cached worker.
-    if (pid_ > 0 && loaded_ok_ && loaded_cfg_.backend == cfg.backend && loaded_cfg_.model == cfg.model &&
+    const std::string want_gpu = next_gpu_.empty() ? default_gpu_ : next_gpu_;
+    if (pid_ > 0 && loaded_ok_ && worker_gpu_ == want_gpu &&
+        loaded_cfg_.backend == cfg.backend && loaded_cfg_.model == cfg.model &&
         loaded_cfg_.use_gpu == cfg.use_gpu && loaded_cfg_.gpu_device == cfg.gpu_device &&
         loaded_cfg_.flash_attn == cfg.flash_attn && loaded_cfg_.model_quant == cfg.model_quant) {
         return true;
     }
 
-    if (pid_ > 0)
+    if (pid_ > 0) {
+        if (worker_gpu_ != want_gpu)
+            fprintf(stderr, "crispasr-session: relocating worker '%s' -> '%s'\n",
+                    worker_gpu_.c_str(), want_gpu.c_str());
         kill_worker_locked();
+    }
 
-    pid_t child = spawn_worker(argv0_.c_str(), extra_argv_, &fd_);
+    pid_t child = spawn_worker(argv0_.c_str(), extra_argv_, &fd_, want_gpu);
+    worker_gpu_ = want_gpu;
     if (child < 0) {
         last_error_ = "spawn_worker failed";
         return false;

@@ -70,7 +70,7 @@ bool unpack_stereo_payload(const std::vector<uint8_t>&, std::string*, std::vecto
     return false;
 }
 
-pid_t spawn_worker(const char*, const std::vector<std::string>&, int*) {
+pid_t spawn_worker(const char*, const std::vector<std::string>&, int*, const std::string&) {
     return -1;
 }
 
@@ -366,7 +366,8 @@ bool unpack_stereo_payload(const std::vector<uint8_t>& payload, std::string* out
     return true;
 }
 
-pid_t spawn_worker(const char* self_argv0, const std::vector<std::string>& extra_argv, int* out_parent_fd) {
+pid_t spawn_worker(const char* self_argv0, const std::vector<std::string>& extra_argv, int* out_parent_fd,
+                   const std::string& cuda_visible_devices) {
     int sv[2];
     if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
         std::fprintf(stderr, "spawn_worker: socketpair failed: %s\n", std::strerror(errno));
@@ -403,6 +404,11 @@ pid_t spawn_worker(const char* self_argv0, const std::vector<std::string>& extra
     if (pid == 0) {
         // CHILD. Build argv: [self_argv0, "--worker", "<fd>", extra_argv...].
         ::close(parent_fd);
+
+        // Pin this worker to a specific GPU before execv (parent is CUDA-free).
+        if (!cuda_visible_devices.empty()) {
+            ::setenv("CUDA_VISIBLE_DEVICES", cuda_visible_devices.c_str(), 1);
+        }
 
         char fd_buf[16];
         std::snprintf(fd_buf, sizeof(fd_buf), "%d", worker_fd);

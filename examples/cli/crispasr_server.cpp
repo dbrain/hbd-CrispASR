@@ -435,6 +435,10 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             std::strncpy(self_path, "/usr/local/bin/crispasr", sizeof(self_path) - 1);
         }
         worker = std::make_unique<crispasr::WorkerSession>(self_path, worker_extra_argv);
+        if (const char* g = std::getenv("WORKER_DEFAULT_GPU")) {
+            worker->set_default_gpu(g);
+            fprintf(stderr, "crispasr-server: default GPU = %s\n", g);
+        }
         fprintf(stderr, "crispasr-server: PARAKEET_WORKER_ISOLATION=1 — model loads in subprocess (argv0=%s)\n",
                 self_path);
     }
@@ -661,6 +665,8 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         if (!require_auth(req, res))
             return;
         touch_last_request();
+        if (worker) worker->set_next_gpu(req.has_file("gpu") ? req.get_file_value("gpu").content
+                                                             : req.get_param_value("gpu"));
         if (!ensure_loaded(res))
             return;
 
@@ -734,6 +740,9 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         if (!require_auth(req, res))
             return;
         touch_last_request();
+        // Per-request GPU target (gate placement) — relocates on next ensure.
+        if (worker) worker->set_next_gpu(req.has_file("gpu") ? req.get_file_value("gpu").content
+                                                             : req.get_param_value("gpu"));
         if (!ensure_loaded(res))
             return;
 
