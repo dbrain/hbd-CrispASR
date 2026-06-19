@@ -948,6 +948,23 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     });
 
     // -----------------------------------------------------------------------
+    // GET /v1/gpu/status — GPU residency announce for the koblem gate.
+    // -----------------------------------------------------------------------
+    svr.Get("/v1/gpu/status", [&](const Request&, Response& res) {
+        bool loaded = model_loaded.load();
+        if (worker && !worker->is_alive())
+            loaded = false;
+        std::ostringstream js;
+        js << "{\"loaded\": " << (loaded ? "true" : "false");
+        if (loaded && worker && !worker->worker_gpu().empty())
+            js << ", \"gpu\": \"" << crispasr_json_escape(worker->worker_gpu()) << "\"";
+        else
+            js << ", \"gpu\": null";
+        js << "}";
+        res.set_content(js.str(), "application/json");
+    });
+
+    // -----------------------------------------------------------------------
     // GET /backends
     // -----------------------------------------------------------------------
     svr.Get("/backends", [&](const Request& req, Response& res) {

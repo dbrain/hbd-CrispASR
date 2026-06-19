@@ -74,6 +74,8 @@ public:
     // reconciliation, not a mutation of observable behaviour.
     bool        is_alive() const;
     pid_t       pid() const { return pid_; }
+    // GPU (UUID) the live worker is pinned to. Empty if never spawned.
+    const std::string & worker_gpu() const { return worker_gpu_; }
     int32_t     sample_rate() const { return sample_rate_; }
     uint32_t    capabilities() const { return capabilities_; }
     const std::string& backend_name() const { return backend_name_; }
