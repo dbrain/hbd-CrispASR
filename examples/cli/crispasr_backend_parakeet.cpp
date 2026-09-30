@@ -13,6 +13,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <map>
 
 namespace {
 
@@ -31,7 +32,7 @@ public:
         // get nothing. With the cap absent, `-dl` correctly routes
         // through the whisper-tiny pre-step.
         return CAP_TIMESTAMPS_NATIVE | CAP_WORD_TIMESTAMPS | CAP_TOKEN_CONFIDENCE | CAP_FLASH_ATTN |
-               CAP_PUNCTUATION_TOGGLE | CAP_TEMPERATURE | CAP_DIARIZE | CAP_PARALLEL_PROCESSORS | CAP_AUTO_DOWNLOAD;
+               CAP_PUNCTUATION_TOGGLE | CAP_TEMPERATURE | CAP_DIARIZE | CAP_PARALLEL_PROCESSORS | CAP_AUTO_DOWNLOAD | CAP_STREAM;
     }
 
     bool init(const whisper_params& p) override {
@@ -109,7 +110,61 @@ public:
         return out;
     }
 
+    bool stream_begin(uint32_t sid, const crispasr_stream_opts& o) override {
+        if (!ctx_)
+            return false;
+        stream_end(sid);
+        parakeet_stream_params sp = parakeet_stream_default_params();
+        sp.chunk_sec = o.chunk_sec;
+        sp.right_sec = o.right_sec;
+        sp.left_sec = o.left_sec;
+        parakeet_stream* st = parakeet_stream_begin(ctx_, sp);
+        if (!st)
+            return false;
+        streams_[sid] = st;
+        return true;
+    }
+
+    crispasr_stream_delta stream_feed(uint32_t sid, const float* samples, int n_samples, bool final,
+                                      int partial) override {
+        crispasr_stream_delta d;
+        auto it = streams_.find(sid);
+        if (!ctx_ || it == streams_.end()) {
+            d.error = "unknown stream";
+            return d;
+        }
+        char* ptext = nullptr;
+        parakeet_result* r = parakeet_stream_feed(ctx_, it->second, samples, n_samples, final ? 1 : 0, partial, &ptext);
+        if (final)
+            stream_end(sid);
+        if (!r) {
+            free(ptext);
+            d.error = "stream decode failed";
+            return d;
+        }
+        d.ok = true;
+        d.text = r->text ? r->text : "";
+        for (int i = 0; i < r->n_words; i++)
+            d.words.push_back({r->words[i].text, r->words[i].t0, r->words[i].t1});
+        if (ptext)
+            d.partial = ptext;
+        free(ptext);
+        parakeet_result_free(r);
+        return d;
+    }
+
+    void stream_end(uint32_t sid) override {
+        auto it = streams_.find(sid);
+        if (it != streams_.end()) {
+            parakeet_stream_free(it->second);
+            streams_.erase(it);
+        }
+    }
+
     void shutdown() override {
+        for (auto& [sid, st] : streams_)
+            parakeet_stream_free(st);
+        streams_.clear();
         if (ctx_) {
             parakeet_free(ctx_);
             ctx_ = nullptr;
@@ -118,6 +173,7 @@ public:
 
 private:
     parakeet_context* ctx_ = nullptr;
+    std::map<uint32_t, parakeet_stream*> streams_;
 };
 
 } // namespace

@@ -44,6 +44,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -263,7 +264,7 @@ static bool check_cancel(const std::string& cancel_url) {
 
 // Decode audio from a path on disk and transcribe it. Caller is responsible
 // for placing audio at `audio_path` (either a real file_path or a temp file
-// written from a multipart upload). Acquires model_mutex internally.
+// written from a multipart upload). Acquires model_mutex itself (per chunk in worker mode).
 //
 // Between chunks the loop polls cancel_url; on a cancel signal it sets
 // preempted=true and returns whatever has transcribed so far. Useful when
@@ -310,7 +311,17 @@ static transcription_result do_transcribe(const std::string& audio_path, Crispas
     // result" (silent chunk) from "worker died and the call returned {}".
     // Without this distinction the chunked path used to silently swallow
     // worker death and return a partial transcript flagged ok=true.
+    //
+    // Worker mode takes model_mutex per chunk, not per file, so live /v1/stream feeds interleave
+    // with a long file job and wait at most one chunk. In-process mode holds it for the whole file:
+    // /unload frees `backend` outright, and this raw pointer must not outlive it mid-file.
+    std::unique_lock<std::mutex> file_lock(model_mutex, std::defer_lock);
+    if (!worker)
+        file_lock.lock();
     auto run_one = [&](const float* p, int n, int64_t t_off_cs, bool* worker_died) {
+        std::unique_lock<std::mutex> chunk_lock(model_mutex, std::defer_lock);
+        if (worker)
+            chunk_lock.lock();
         std::vector<crispasr_segment> segs =
             worker ? worker->transcribe(p, n, t_off_cs, rp) : backend->transcribe(p, n, t_off_cs, rp);
         *worker_died = worker && !worker->is_alive();
@@ -318,7 +329,6 @@ static transcription_result do_transcribe(const std::string& audio_path, Crispas
     };
 
     {
-        std::lock_guard<std::mutex> lock(model_mutex);
         auto t0 = std::chrono::steady_clock::now();
 
         bool worker_died = false;
@@ -836,6 +846,197 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             res.set_content(crispasr_segments_to_openai_json(result.segs), "application/json");
         }
         touch_last_request();
+    });
+
+    // -----------------------------------------------------------------------
+    // Windowed streaming (CAP_STREAM backends)
+    //
+    //   POST   /v1/stream                 {chunk_sec, right_sec, left_sec} (all optional) → {"id"}
+    //   POST   /v1/stream/<id>/audio      body = raw s16le 16 kHz mono PCM, any length
+    //                                     ?final=1 flushes and closes; ?partial=1 adds the
+    //                                     uncommitted lookahead text, ?partial=2 re-encodes up
+    //                                     to the newest sample first (ask when speech stops)
+    //                                     → {"text": committed delta, "partial", "words", "done"}
+    //   DELETE /v1/stream/<id>
+    //
+    // Streams live in the worker, so a worker restart (unload, GPU relocation, crash) ends them:
+    // feeds then get 410 and the client opens a new stream. Streams idle for 120 s are dropped.
+    // Feeds share model_mutex with file transcription, which takes it per 30 s chunk, so a feed
+    // waits at most one chunk behind a long file job.
+    // -----------------------------------------------------------------------
+    using sjson = nlohmann::json;
+    struct live_stream {
+        uint32_t sid;
+        pid_t worker_pid;
+        int64_t last_ms;
+    };
+    std::mutex streams_mutex;
+    std::map<std::string, live_stream> streams;
+    std::atomic<uint32_t> next_sid{1};
+    auto now_ms = []() {
+        return (int64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    };
+    // Runs one stream op on the worker or the in-process backend. Caller holds model_mutex.
+    auto stream_op = [&](const sjson& meta, const float* pcm, int n) -> sjson {
+        if (worker)
+            return worker->stream(meta, pcm, n);
+        if (!backend)
+            return {{"error", "no model loaded"}};
+        const std::string op = meta.value("op", std::string{});
+        const uint32_t sid = meta.value("sid", 0u);
+        if (op == "begin") {
+            crispasr_stream_opts o;
+            o.chunk_sec = meta.value("chunk_sec", o.chunk_sec);
+            o.right_sec = meta.value("right_sec", o.right_sec);
+            o.left_sec = meta.value("left_sec", o.left_sec);
+            if (!backend->stream_begin(sid, o))
+                return {{"error", std::string("backend '") + backend->name() + "' cannot stream"}};
+            return sjson::object();
+        }
+        if (op == "end") {
+            backend->stream_end(sid);
+            return sjson::object();
+        }
+        auto d = backend->stream_feed(sid, pcm, n, meta.value("final", false), meta.value("partial", 0));
+        if (!d.ok)
+            return {{"error", d.error}};
+        sjson words = sjson::array();
+        for (const auto& w : d.words)
+            words.push_back({{"word", w.text}, {"start", w.t0 / 100.0}, {"end", w.t1 / 100.0}});
+        return {{"text", d.text}, {"partial", d.partial}, {"words", words}};
+    };
+    auto current_pid = [&]() -> pid_t { return worker ? worker->pid() : 0; };
+
+    svr.Post("/v1/stream", [&](const Request& req, Response& res) {
+        if (!require_auth(req, res))
+            return;
+        touch_last_request();
+        if (!ensure_loaded(res))
+            return;
+        sjson body = sjson::object();
+        if (!req.body.empty()) {
+            try {
+                body = sjson::parse(req.body);
+            } catch (const std::exception&) {
+                json_error(res, 400, "body must be JSON");
+                return;
+            }
+        }
+        sjson meta = {{"op", "begin"}};
+        for (const char* k : {"chunk_sec", "right_sec", "left_sec"})
+            if (body.contains(k) && body[k].is_number())
+                meta[k] = body[k].get<float>();
+        // Drop idle streams first.
+        std::vector<uint32_t> stale;
+        {
+            std::lock_guard<std::mutex> lk(streams_mutex);
+            for (auto it = streams.begin(); it != streams.end();) {
+                if (now_ms() - it->second.last_ms > 120000) {
+                    if (it->second.worker_pid == current_pid())
+                        stale.push_back(it->second.sid);
+                    it = streams.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        const uint32_t sid = next_sid.fetch_add(1);
+        meta["sid"] = sid;
+        sjson r;
+        pid_t pid;
+        {
+            std::lock_guard<std::mutex> lock(model_mutex);
+            for (uint32_t s : stale)
+                stream_op({{"op", "end"}, {"sid", s}}, nullptr, 0);
+            r = stream_op(meta, nullptr, 0);
+            pid = current_pid();
+        }
+        if (r.contains("error")) {
+            json_error(res, 400, r["error"].get<std::string>());
+            return;
+        }
+        const std::string id = std::to_string(sid) + "-" + std::to_string(now_ms());
+        {
+            std::lock_guard<std::mutex> lk(streams_mutex);
+            streams[id] = {sid, pid, now_ms()};
+        }
+        res.set_content(sjson({{"id", id}}).dump(), "application/sjson");
+    });
+
+    svr.Post(R"(/v1/stream/([\w-]+)/audio)", [&](const Request& req, Response& res) {
+        if (!require_auth(req, res))
+            return;
+        touch_last_request();
+        const std::string id = req.matches[1];
+        live_stream ls;
+        {
+            std::lock_guard<std::mutex> lk(streams_mutex);
+            auto it = streams.find(id);
+            if (it == streams.end()) {
+                json_error(res, 404, "unknown stream");
+                return;
+            }
+            it->second.last_ms = now_ms();
+            ls = it->second;
+        }
+        if (req.body.size() % 2) {
+            json_error(res, 400, "body must be s16le PCM (even byte count)");
+            return;
+        }
+        const size_t n = req.body.size() / 2;
+        std::vector<float> pcm(n);
+        const auto* p = reinterpret_cast<const unsigned char*>(req.body.data());
+        for (size_t i = 0; i < n; i++)
+            pcm[i] = (float)(int16_t)(p[2 * i] | (p[2 * i + 1] << 8)) / 32768.0f;
+        const bool final = req.get_param_value("final") == "1";
+        sjson meta = {{"op", "feed"}, {"sid", ls.sid}, {"final", final}, {"partial", req.get_param_value("partial").empty() ? 0 : std::atoi(req.get_param_value("partial").c_str())}};
+        sjson r;
+        bool lost = false;
+        {
+            std::lock_guard<std::mutex> lock(model_mutex);
+            lost = !model_loaded.load() || current_pid() != ls.worker_pid || (worker && !worker->is_alive());
+            if (!lost)
+                r = stream_op(meta, pcm.data(), (int)n);
+        }
+        if (lost || final || r.contains("error")) {
+            std::lock_guard<std::mutex> lk(streams_mutex);
+            streams.erase(id);
+        }
+        if (lost) {
+            json_error(res, 410, "stream lost (model unloaded or worker restarted); open a new one");
+            return;
+        }
+        if (r.contains("error")) {
+            json_error(res, 500, r["error"].get<std::string>());
+            return;
+        }
+        r["done"] = final;
+        res.set_content(r.dump(), "application/sjson");
+    });
+
+    svr.Delete(R"(/v1/stream/([\w-]+))", [&](const Request& req, Response& res) {
+        if (!require_auth(req, res))
+            return;
+        const std::string id = req.matches[1];
+        live_stream ls;
+        {
+            std::lock_guard<std::mutex> lk(streams_mutex);
+            auto it = streams.find(id);
+            if (it == streams.end()) {
+                json_error(res, 404, "unknown stream");
+                return;
+            }
+            ls = it->second;
+            streams.erase(it);
+        }
+        {
+            std::lock_guard<std::mutex> lock(model_mutex);
+            if (model_loaded.load() && current_pid() == ls.worker_pid)
+                stream_op({{"op", "end"}, {"sid", ls.sid}}, nullptr, 0);
+        }
+        res.set_content("{\"ok\":true}", "application/sjson");
     });
 
     // -----------------------------------------------------------------------

@@ -85,6 +85,22 @@ enum crispasr_capability : uint32_t {
     CAP_TTS = 1u << 16,                 // text-to-speech synthesis
     CAP_VOICE_CLONING = 1u << 17,       // TTS: synthesise with --voice <reference.wav>
     CAP_PUNCTUATION_NATIVE = 1u << 18,  // backend already emits punctuation by default
+    CAP_STREAM = 1u << 19,              // windowed streaming (stream_begin/feed/end)
+};
+
+// Windowed streaming (CAP_STREAM). Text in a delta is final; `partial` is the not-yet-committed
+// lookahead, replaced wholesale by the next delta.
+struct crispasr_stream_opts {
+    float chunk_sec = 0.64f;
+    float right_sec = 0.64f;
+    float left_sec = 10.0f;
+};
+struct crispasr_stream_delta {
+    bool ok = false;
+    std::string error;
+    std::string text; // committed this call, leading space kept so deltas concatenate
+    std::string partial;
+    std::vector<crispasr_word> words; // committed words, absolute times from the stream start
 };
 
 // ---------------------------------------------------------------------------
@@ -148,6 +164,28 @@ public:
         (void)tgt_lang;
         return {};
     }
+
+    // Windowed streaming (CAP_STREAM only). `sid` is chosen by the caller and names a stream on
+    // this backend instance; several may be open at once. feed with final=true flushes and
+    // closes the stream.
+    virtual bool stream_begin(uint32_t sid, const crispasr_stream_opts& opts) {
+        (void)sid;
+        (void)opts;
+        return false;
+    }
+    // partial: 0 none, 1 provisional text from the last window, 2 fresh (re-encode up to now).
+    virtual crispasr_stream_delta stream_feed(uint32_t sid, const float* samples, int n_samples, bool final,
+                                              int partial) {
+        (void)sid;
+        (void)samples;
+        (void)n_samples;
+        (void)final;
+        (void)partial;
+        crispasr_stream_delta d;
+        d.error = "streaming not supported by this backend";
+        return d;
+    }
+    virtual void stream_end(uint32_t sid) { (void)sid; }
 
     // Release all resources.
     virtual void shutdown() = 0;

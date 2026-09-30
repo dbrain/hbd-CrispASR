@@ -56,6 +56,8 @@ enum class WorkerFrame : uint32_t {
     TRANSCRIBE_REQ        = 0x20, // P→W  json header + raw f32 samples
     TRANSCRIBE_RESP       = 0x21, // W→P  json segments
     TRANSCRIBE_STEREO_REQ = 0x22, // P→W  json header + raw f32 L samples + raw f32 R samples
+    STREAM_REQ            = 0x24, // P→W  json {"op": begin|feed|end, "sid", opts, "final", "partial"} + raw f32
+    STREAM_RESP           = 0x25, // W→P  json {"text", "partial", "words"}
     SYNTH_REQ             = 0x30, // P→W  {"text": str, "params": json}
     SYNTH_RESP            = 0x31, // W→P  json header + raw f32 audio
     ERR_RESP              = 0x2F, // W→P  {"error": str}  — generic per-request failure

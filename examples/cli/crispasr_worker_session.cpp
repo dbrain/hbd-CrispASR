@@ -701,6 +701,39 @@ std::vector<crispasr_segment> WorkerSession::transcribe_stereo(const float* left
     return do_transcribe_locked(WorkerFrame::TRANSCRIBE_STEREO_REQ, payload);
 }
 
+json WorkerSession::stream(const json& meta, const float* samples, int n_samples) {
+    std::lock_guard<std::mutex> lock(io_mutex_);
+    if (pid_ <= 0 || fd_ < 0 || !loaded_ok_)
+        return {{"error", "worker not ready"}};
+    json m = meta;
+    m["n_samples"] = n_samples;
+    uint32_t req_id = next_req_id_.fetch_add(1);
+    IpcError e = send_frame_audio(fd_, WorkerFrame::STREAM_REQ, req_id, m.dump(), samples, (size_t)n_samples);
+    if (e != IpcError::OK) {
+        last_error_ = std::string("STREAM_REQ send failed: ") + ipc_error_str(e);
+        kill_worker_locked();
+        return {{"error", last_error_}};
+    }
+    FrameHeader hdr{};
+    std::vector<uint8_t> resp;
+    e = recv_frame(fd_, &hdr, &resp);
+    if (e != IpcError::OK) {
+        last_error_ = std::string("STREAM_RESP recv failed: ") + ipc_error_str(e);
+        kill_worker_locked();
+        return {{"error", last_error_}};
+    }
+    try {
+        json j = json::parse(std::string(resp.begin(), resp.end()));
+        if (hdr.type == static_cast<uint32_t>(WorkerFrame::ERR_RESP))
+            return {{"error", j.value("error", std::string{"unknown worker error"})}};
+        if (hdr.type != static_cast<uint32_t>(WorkerFrame::STREAM_RESP))
+            return {{"error", "unexpected frame from worker"}};
+        return j;
+    } catch (const std::exception& ex) {
+        return {{"error", std::string("STREAM_RESP parse: ") + ex.what()}};
+    }
+}
+
 std::vector<float> WorkerSession::synthesize(const std::string& text, const whisper_params& params) {
     std::lock_guard<std::mutex> lock(io_mutex_);
     if (pid_ <= 0 || fd_ < 0 || !loaded_ok_) {
@@ -959,6 +992,59 @@ int run_worker_loop(int fd) {
             json out = {{"segments", segments_to_json(segs)}};
             if (send_frame(fd, WorkerFrame::TRANSCRIBE_RESP, hdr.req_id, out.dump()) != IpcError::OK) {
                 std::fprintf(stderr, "crispasr-worker: TRANSCRIBE_RESP (stereo) send failed\n");
+                return 5;
+            }
+            break;
+        }
+        case WorkerFrame::STREAM_REQ: {
+            if (!backend) {
+                err_resp(hdr.req_id, "no model loaded (LOAD_REQ first)");
+                break;
+            }
+            std::string meta_str;
+            std::vector<float> samples;
+            json meta;
+            if (!unpack_audio_payload(payload, &meta_str, &samples)) {
+                err_resp(hdr.req_id, "STREAM_REQ unpack failed");
+                break;
+            }
+            try {
+                meta = json::parse(meta_str);
+            } catch (const std::exception& ex) {
+                err_resp(hdr.req_id, std::string("STREAM_REQ meta parse: ") + ex.what());
+                break;
+            }
+            const std::string op = meta.value("op", std::string{});
+            const uint32_t sid = meta.value("sid", 0u);
+            json out = json::object();
+            if (op == "begin") {
+                crispasr_stream_opts o;
+                o.chunk_sec = meta.value("chunk_sec", o.chunk_sec);
+                o.right_sec = meta.value("right_sec", o.right_sec);
+                o.left_sec = meta.value("left_sec", o.left_sec);
+                if (!backend->stream_begin(sid, o)) {
+                    err_resp(hdr.req_id, std::string("backend '") + backend->name() + "' cannot stream");
+                    break;
+                }
+            } else if (op == "feed") {
+                auto d = backend->stream_feed(sid, samples.data(), (int)samples.size(), meta.value("final", false),
+                                              meta.value("partial", 0));
+                if (!d.ok) {
+                    err_resp(hdr.req_id, d.error);
+                    break;
+                }
+                json words = json::array();
+                for (const auto& w : d.words)
+                    words.push_back({{"word", w.text}, {"start", w.t0 / 100.0}, {"end", w.t1 / 100.0}});
+                out = {{"text", d.text}, {"partial", d.partial}, {"words", words}};
+            } else if (op == "end") {
+                backend->stream_end(sid);
+            } else {
+                err_resp(hdr.req_id, "STREAM_REQ unknown op '" + op + "'");
+                break;
+            }
+            if (send_frame(fd, WorkerFrame::STREAM_RESP, hdr.req_id, out.dump()) != IpcError::OK) {
+                std::fprintf(stderr, "crispasr-worker: STREAM_RESP send failed\n");
                 return 5;
             }
             break;

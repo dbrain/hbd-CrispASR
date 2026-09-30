@@ -18,6 +18,7 @@
 #include "crispasr_backend.h"
 #include "crispasr_worker_ipc.h"
 #include "whisper_params.h"
+#include "../json.hpp"
 
 #include <atomic>
 #include <cstdint>
@@ -104,6 +105,11 @@ public:
     // backend-specific; see CrispasrBackend::synthesize comment). On IPC
     // failure returns an empty vector and sets last_error_.
     std::vector<float> synthesize(const std::string& text, const whisper_params& params);
+
+    // Windowed streaming: forwards one STREAM_REQ (meta = {"op", "sid", ...}) with optional PCM.
+    // Returns the worker's STREAM_RESP json, or {"error": ...}. Streams live in the worker, so they
+    // die with it; callers compare pid() against the pid the stream was opened on.
+    nlohmann::json stream(const nlohmann::json& meta, const float* samples, int n_samples);
 
 private:
     bool send_load_req_locked(const WorkerLoadConfig& cfg);
