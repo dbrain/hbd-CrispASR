@@ -1819,42 +1819,25 @@ static bool tdt_gpu_run_joint(parakeet_context* ctx, const float* enc_t_data, in
     return true;
 }
 
-static std::vector<parakeet_emitted_token> parakeet_tdt_decode_gpu(parakeet_context* ctx, const float* enc, int T_enc,
-                                                                   int d_model, parakeet_timing* tim) {
+// TDT decode over encoder frames [t, t_stop) of `enc` (T_enc frames), continuing from whatever
+// predictor state is in the persistent tdt_gpu tensors. Appends to `emitted`; returns the frame the
+// decoder resumes at (>= t_stop: a duration skip can overshoot past t_stop), or -1 on failure.
+// Whole-utterance decode is one call after tdt_gpu_start(); windowed streaming calls it once per
+// chunk with the state carried over.
+static int tdt_gpu_decode_range(parakeet_context* ctx, const float* enc, int T_enc, int d_model, int t, int t_stop,
+                                std::vector<parakeet_emitted_token>& emitted, parakeet_timing* tim) {
     using clk = std::chrono::high_resolution_clock;
-    parakeet_tdt_gpu_init(ctx);
-    if (!ctx->tdt_gpu.initialised) {
-        fprintf(stderr, "parakeet: tdt_gpu init failed; falling back to CPU\n");
-        return {};
-    }
-    parakeet_tdt_gpu_reset_state(ctx);
-
     const auto& hp = ctx->model.hparams;
     const int blank_id = (int)hp.blank_id;
     const int n_dur = (int)hp.n_tdt_durations;
     const int max_per_step = 10;
 
-    // SOS: predictor step on the blank token before any joint call.
-    {
-        auto _t = clk::now();
-        if (!tdt_gpu_run_predictor(ctx, blank_id))
-            return {};
-        if (tim) {
-            const double dt = ms_since(_t);
-            tim->t_pred_step_ms += dt;
-            tim->pred_step_us.push_back(dt * 1000.0);
-        }
-    }
-
-    std::vector<parakeet_emitted_token> emitted;
-    emitted.reserve(256);
     std::vector<float> logits;
 
     const bool sampling = ctx->decode_temperature > 0.0f;
     std::mt19937_64 rng(ctx->decode_seed != 0 ? ctx->decode_seed : (uint64_t)std::random_device{}());
 
-    int t = 0;
-    while (t < T_enc) {
+    while (t < t_stop) {
         if (tim) tim->n_t_steps++;
         const float* enc_t = enc + (size_t)t * d_model;
 
@@ -1867,7 +1850,7 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode_gpu(parakeet_cont
             {
                 auto _t = clk::now();
                 if (!tdt_gpu_run_joint(ctx, enc_t, d_model, logits))
-                    return emitted;
+                    return -1;
                 js_ms = ms_since(_t);
                 if (tim) {
                     tim->t_joint_step_ms += js_ms;
@@ -1880,7 +1863,7 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode_gpu(parakeet_cont
             if ((int)logits.size() < n_vocab_blk + n_dur) {
                 fprintf(stderr, "parakeet: tdt_gpu logits size %zu < expected %d\n", logits.size(),
                         n_vocab_blk + n_dur);
-                return emitted;
+                return -1;
             }
 
             auto _t_argmax = clk::now();
@@ -1953,7 +1936,7 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode_gpu(parakeet_cont
             {
                 auto _t = clk::now();
                 if (!tdt_gpu_run_predictor(ctx, tok))
-                    return emitted;
+                    return -1;
                 if (tim) {
                     const double dt = ms_since(_t);
                     tim->t_pred_step_ms += dt;
@@ -1974,6 +1957,37 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode_gpu(parakeet_cont
     }
 
     ctx->tdt_gpu.ever_used = true;
+    return t;
+}
+
+// SOS: reset the LSTM state and run the predictor on the blank token before any joint call.
+static bool tdt_gpu_start(parakeet_context* ctx, parakeet_timing* tim) {
+    using clk = std::chrono::high_resolution_clock;
+    parakeet_tdt_gpu_init(ctx);
+    if (!ctx->tdt_gpu.initialised)
+        return false;
+    parakeet_tdt_gpu_reset_state(ctx);
+    auto _t = clk::now();
+    if (!tdt_gpu_run_predictor(ctx, (int)ctx->model.hparams.blank_id))
+        return false;
+    if (tim) {
+        const double dt = ms_since(_t);
+        tim->t_pred_step_ms += dt;
+        tim->pred_step_us.push_back(dt * 1000.0);
+    }
+    return true;
+}
+
+static std::vector<parakeet_emitted_token> parakeet_tdt_decode_gpu(parakeet_context* ctx, const float* enc, int T_enc,
+                                                                   int d_model, parakeet_timing* tim) {
+    if (!tdt_gpu_start(ctx, tim)) {
+        if (!ctx->tdt_gpu.initialised)
+            fprintf(stderr, "parakeet: tdt_gpu init failed; falling back to CPU\n");
+        return {};
+    }
+    std::vector<parakeet_emitted_token> emitted;
+    emitted.reserve(256);
+    tdt_gpu_decode_range(ctx, enc, T_enc, d_model, 0, T_enc, emitted, tim);
     return emitted;
 }
 
@@ -2856,6 +2870,242 @@ static std::string spiece_to_text(const std::string& piece) {
     return piece;
 }
 
+// Emitted TDT tokens -> parakeet_result (text, per-token and per-word timings). Token frames are
+// relative to t_offset_cs. Streaming deltas keep the leading space so they concatenate.
+static parakeet_result* parakeet_build_result(parakeet_context* ctx, const std::vector<parakeet_emitted_token>& emitted,
+                                              int64_t t_offset_cs, bool strip_leading_space,
+                                              bool space_words = false) {
+    auto* r = (parakeet_result*)calloc(1, sizeof(parakeet_result));
+    r->n_tokens = (int)emitted.size();
+    r->tokens = (parakeet_token_data*)calloc(r->n_tokens > 0 ? r->n_tokens : 1, sizeof(parakeet_token_data));
+    std::string text;
+    const int frame_dur_cs = (int)ctx->model.hparams.frame_dur_cs;
+    // Quality debug: PARAKEET_DUMP_TOKENS=1 prints id/piece/bytes for every
+    // emitted token, used to compare against python NeMo's y_sequence.
+    const bool dump_tokens = []() {
+        const char* e = getenv("PARAKEET_DUMP_TOKENS");
+        return e && *e && strcmp(e, "0") != 0;
+    }();
+    for (int i = 0; i < r->n_tokens; i++) {
+        const auto& e = emitted[i];
+        const std::string& piece =
+            (e.id >= 0 && e.id < (int)ctx->vocab.id_to_token.size()) ? ctx->vocab.id_to_token[e.id] : std::string("");
+        std::string vis = spiece_to_text(piece);
+        if (dump_tokens) {
+            fprintf(stderr, "[tok %3d] id=%5d t=%d..%d p=%.3f piece='%s' bytes=", i, e.id, e.t_start, e.t_end, e.p,
+                    piece.c_str());
+            for (size_t b = 0; b < piece.size() && b < 8; b++)
+                fprintf(stderr, "%02x ", (unsigned char)piece[b]);
+            fprintf(stderr, "vis='%s'\n", vis.c_str());
+        }
+
+        parakeet_token_data& td = r->tokens[i];
+        td.id = e.id;
+        td.t0 = t_offset_cs + (int64_t)e.t_start * frame_dur_cs;
+        td.t1 = t_offset_cs + (int64_t)e.t_end * frame_dur_cs;
+        td.p = e.p;
+        size_t n = std::min(vis.size(), sizeof(td.text) - 1);
+        memcpy(td.text, vis.data(), n);
+        td.text[n] = '\0';
+        text += vis;
+    }
+    // strip leading space
+    if (strip_leading_space && !text.empty() && text[0] == ' ')
+        text = text.substr(1);
+    r->text = strdup(text.c_str());
+
+    // ----- Group sub-word tokens into words -----
+    //
+    // Latin SentencePiece convention: a token starting with U+2581 (▁ → ' ')
+    // begins a new word. Punctuation tokens attach to the previous word.
+    //
+    // Japanese parakeet (and other no-space tokenizers) emit no leading-space
+    // markers because written Japanese has no inter-word spaces. In that
+    // mode every non-punctuation token is its own "word" — sufficient
+    // granularity for word-level SRT (issue #37).
+    {
+        std::vector<parakeet_word_data> words;
+        words.reserve(r->n_tokens);
+
+        // Detect tokenizer style: count tokens that look like real
+        // word-starts (leading space + at least one more char). A
+        // standalone " " token (BOS-ish) doesn't count.
+        int n_space_word_starts = 0;
+        for (int i = 0; i < r->n_tokens; i++) {
+            const char* t = r->tokens[i].text;
+            if (t[0] == ' ' && t[1] != '\0')
+                n_space_word_starts++;
+        }
+        // Streaming deltas are too short to detect the style from; they say so.
+        const bool space_prefix_style = space_words || (n_space_word_starts >= 2);
+
+        // Pure-punctuation detector. Recognises ASCII punct plus the
+        // common CJK punctuation (。、？！「」『』・,) so JA tokens
+        // like "、" attach to the previous word instead of forming their
+        // own subtitle entry. Defined before refinement so we can re-use it.
+        auto is_punct_only = [](const char* s) {
+            if (!s || !*s)
+                return false;
+            const unsigned char* p = (const unsigned char*)s;
+            while (*p) {
+                unsigned char c = *p;
+                if (c < 0x80) {
+                    if (!(c == '.' || c == ',' || c == '?' || c == '!' || c == ';' || c == ':' || c == '\'' ||
+                          c == '"' || c == '(' || c == ')' || c == '-'))
+                        return false;
+                    p++;
+                } else if (c == 0xE3 && p[1] == 0x80 && p[2] >= 0x80 && p[2] <= 0xBF) {
+                    // U+3000–U+303F: CJK Symbols and Punctuation (。、「」『』 etc.)
+                    p += 3;
+                } else if (c == 0xE3 && p[1] == 0x83 && p[2] == 0xBB) {
+                    // U+30FB ・ (katakana middle dot)
+                    p += 3;
+                } else if (c == 0xEF && p[1] == 0xBC && ((p[2] >= 0x81 && p[2] <= 0x8F) || p[2] == 0x9F)) {
+                    // U+FF01–U+FF0F (full-width !"#$%&'()*+,-./) and U+FF1F (？)
+                    p += 3;
+                } else {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        // Punct-token timestamp refinement (NeMo's _refine_timestamps_tdt).
+        // The TDT decoder often emits "." / "?" / "!" several frames AFTER
+        // the audible end of the preceding word — the model "saves" the
+        // punct prediction across silence. Without refinement, the period
+        // glued onto the previous word in word-grouping pulls word.t1
+        // hundreds of ms past the actual end of the spoken word, which
+        // shows up in readalong as the highlight lingering on the last
+        // word of a sentence.
+        //
+        // NeMo handles this by snapping each punct token's [start,end] to
+        // [prev.end, prev.end] before grouping. Mirror that here in place
+        // on r->tokens so the grouper's cur.t1 update naturally lands on
+        // the previous (non-punct) token's end.
+        for (int i = 1; i < r->n_tokens; i++) {
+            if (is_punct_only(r->tokens[i].text)) {
+                r->tokens[i].t0 = r->tokens[i - 1].t1;
+                r->tokens[i].t1 = r->tokens[i - 1].t1;
+            }
+        }
+
+        // True end-of-sentence punct (for the gap-insertion pass below).
+        auto ends_with_sentence_punct = [](const char* s) {
+            size_t len = s ? strlen(s) : 0;
+            if (len == 0)
+                return false;
+            unsigned char last = (unsigned char)s[len - 1];
+            if (last == '.' || last == '!' || last == '?')
+                return true;
+            if (len >= 3) {
+                const unsigned char* tail = (const unsigned char*)(s + len - 3);
+                // U+3002 。 = E3 80 82, U+FF01 ！ = EF BC 81, U+FF1F ？ = EF BC 9F
+                if (tail[0] == 0xE3 && tail[1] == 0x80 && tail[2] == 0x82)
+                    return true;
+                if (tail[0] == 0xEF && tail[1] == 0xBC && (tail[2] == 0x81 || tail[2] == 0x9F))
+                    return true;
+            }
+            return false;
+        };
+
+        parakeet_word_data cur = {};
+        bool have_cur = false;
+        // Per-word probability: arithmetic mean of contributing tokens'
+        // softmax probabilities. Tracked alongside `cur`.
+        float cur_p_sum = 0.0f;
+        int cur_p_cnt = 0;
+
+        auto flush_cur = [&]() {
+            if (cur_p_cnt > 0)
+                cur.p = cur_p_sum / (float)cur_p_cnt;
+            words.push_back(cur);
+        };
+
+        for (int i = 0; i < r->n_tokens; i++) {
+            const auto& td = r->tokens[i];
+            if (!td.text[0])
+                continue;
+            // A standalone "▁" piece (vis=" ") is a SentencePiece word boundary
+            // emitted as its own token — common between a word like "April" and
+            // a digit like "2" because the vocab has no "▁2" entry. It must
+            // flush the current word so the digit doesn't glue onto it
+            // ("April 2nd" not "April2nd"); but it carries no characters of its
+            // own so we don't start a new word from it.
+            if (td.text[0] == ' ' && td.text[1] == '\0') {
+                if (have_cur) {
+                    flush_cur();
+                    cur = {};
+                    cur_p_sum = 0.0f;
+                    cur_p_cnt = 0;
+                    have_cur = false;
+                }
+                continue;
+            }
+
+            const bool has_leading_space = (td.text[0] == ' ');
+            const bool is_punct = is_punct_only(td.text);
+
+            // A token starts a new word if either:
+            //   - it has a Latin-style leading-space marker, or
+            //   - the segment is no-space style (e.g. JA) and the token
+            //     is not pure punctuation (so 、 attaches to prev word).
+            const bool is_new_word = !is_punct && (has_leading_space || !space_prefix_style);
+
+            if (is_new_word && have_cur) {
+                flush_cur();
+                cur = {};
+                cur_p_sum = 0.0f;
+                cur_p_cnt = 0;
+                have_cur = false;
+            }
+
+            if (!have_cur) {
+                cur.t0 = td.t0;
+                have_cur = true;
+            }
+            cur.t1 = td.t1;
+            cur_p_sum += td.p;
+            cur_p_cnt += 1;
+
+            // Append, dropping the leading space.
+            const char* src = td.text + (has_leading_space ? 1 : 0);
+            size_t cur_len = strlen(cur.text);
+            size_t cap = sizeof(cur.text) - cur_len - 1;
+            size_t add = strlen(src);
+            if (add > cap)
+                add = cap;
+            memcpy(cur.text + cur_len, src, add);
+            cur.text[cur_len + add] = '\0';
+        }
+        if (have_cur)
+            flush_cur();
+
+        // Post-process: insert minimum gaps after sentence-ending punctuation.
+        // The TDT decoder often produces contiguous timestamps even across
+        // sentence boundaries (e.g. "code." t1==6.400, "In" t0==6.400).
+        // When a word ends with .!?。！？ and the next word starts at the
+        // exact same frame, shrink the punctuated word's t1 by one frame
+        // duration to create a visible gap in subtitles.
+        for (size_t wi = 0; wi + 1 < words.size(); wi++) {
+            if (!ends_with_sentence_punct(words[wi].text))
+                continue;
+            if (words[wi].t1 >= words[wi + 1].t0 && words[wi].t1 > words[wi].t0) {
+                int64_t shrunk = words[wi].t1 - frame_dur_cs;
+                if (shrunk > words[wi].t0)
+                    words[wi].t1 = shrunk;
+            }
+        }
+
+        r->n_words = (int)words.size();
+        r->words = (parakeet_word_data*)calloc(r->n_words > 0 ? r->n_words : 1, sizeof(parakeet_word_data));
+        for (int i = 0; i < r->n_words; i++)
+            r->words[i] = words[i];
+    }
+
+    return r;
+}
+
 extern "C" struct parakeet_result* parakeet_transcribe_ex(struct parakeet_context* ctx, const float* samples,
                                                           int n_samples, int64_t t_offset_cs) {
     if (!ctx || !samples || n_samples <= 0)
@@ -3048,234 +3298,7 @@ extern "C" struct parakeet_result* parakeet_transcribe_ex(struct parakeet_contex
     }
 
     // 4. Build result
-    auto* r = (parakeet_result*)calloc(1, sizeof(parakeet_result));
-    r->n_tokens = (int)emitted.size();
-    r->tokens = (parakeet_token_data*)calloc(r->n_tokens > 0 ? r->n_tokens : 1, sizeof(parakeet_token_data));
-    std::string text;
-    const int frame_dur_cs = (int)ctx->model.hparams.frame_dur_cs;
-    // Quality debug: PARAKEET_DUMP_TOKENS=1 prints id/piece/bytes for every
-    // emitted token, used to compare against python NeMo's y_sequence.
-    const bool dump_tokens = []() {
-        const char* e = getenv("PARAKEET_DUMP_TOKENS");
-        return e && *e && strcmp(e, "0") != 0;
-    }();
-    for (int i = 0; i < r->n_tokens; i++) {
-        const auto& e = emitted[i];
-        const std::string& piece =
-            (e.id >= 0 && e.id < (int)ctx->vocab.id_to_token.size()) ? ctx->vocab.id_to_token[e.id] : std::string("");
-        std::string vis = spiece_to_text(piece);
-        if (dump_tokens) {
-            fprintf(stderr, "[tok %3d] id=%5d t=%d..%d p=%.3f piece='%s' bytes=", i, e.id, e.t_start, e.t_end, e.p,
-                    piece.c_str());
-            for (size_t b = 0; b < piece.size() && b < 8; b++)
-                fprintf(stderr, "%02x ", (unsigned char)piece[b]);
-            fprintf(stderr, "vis='%s'\n", vis.c_str());
-        }
-
-        parakeet_token_data& td = r->tokens[i];
-        td.id = e.id;
-        td.t0 = t_offset_cs + (int64_t)e.t_start * frame_dur_cs;
-        td.t1 = t_offset_cs + (int64_t)e.t_end * frame_dur_cs;
-        td.p = e.p;
-        size_t n = std::min(vis.size(), sizeof(td.text) - 1);
-        memcpy(td.text, vis.data(), n);
-        td.text[n] = '\0';
-        text += vis;
-    }
-    // strip leading space
-    if (!text.empty() && text[0] == ' ')
-        text = text.substr(1);
-    r->text = strdup(text.c_str());
-
-    // ----- Group sub-word tokens into words -----
-    //
-    // Latin SentencePiece convention: a token starting with U+2581 (▁ → ' ')
-    // begins a new word. Punctuation tokens attach to the previous word.
-    //
-    // Japanese parakeet (and other no-space tokenizers) emit no leading-space
-    // markers because written Japanese has no inter-word spaces. In that
-    // mode every non-punctuation token is its own "word" — sufficient
-    // granularity for word-level SRT (issue #37).
-    {
-        std::vector<parakeet_word_data> words;
-        words.reserve(r->n_tokens);
-
-        // Detect tokenizer style: count tokens that look like real
-        // word-starts (leading space + at least one more char). A
-        // standalone " " token (BOS-ish) doesn't count.
-        int n_space_word_starts = 0;
-        for (int i = 0; i < r->n_tokens; i++) {
-            const char* t = r->tokens[i].text;
-            if (t[0] == ' ' && t[1] != '\0')
-                n_space_word_starts++;
-        }
-        const bool space_prefix_style = (n_space_word_starts >= 2);
-
-        // Pure-punctuation detector. Recognises ASCII punct plus the
-        // common CJK punctuation (。、？！「」『』・,) so JA tokens
-        // like "、" attach to the previous word instead of forming their
-        // own subtitle entry. Defined before refinement so we can re-use it.
-        auto is_punct_only = [](const char* s) {
-            if (!s || !*s)
-                return false;
-            const unsigned char* p = (const unsigned char*)s;
-            while (*p) {
-                unsigned char c = *p;
-                if (c < 0x80) {
-                    if (!(c == '.' || c == ',' || c == '?' || c == '!' || c == ';' || c == ':' || c == '\'' ||
-                          c == '"' || c == '(' || c == ')' || c == '-'))
-                        return false;
-                    p++;
-                } else if (c == 0xE3 && p[1] == 0x80 && p[2] >= 0x80 && p[2] <= 0xBF) {
-                    // U+3000–U+303F: CJK Symbols and Punctuation (。、「」『』 etc.)
-                    p += 3;
-                } else if (c == 0xE3 && p[1] == 0x83 && p[2] == 0xBB) {
-                    // U+30FB ・ (katakana middle dot)
-                    p += 3;
-                } else if (c == 0xEF && p[1] == 0xBC && ((p[2] >= 0x81 && p[2] <= 0x8F) || p[2] == 0x9F)) {
-                    // U+FF01–U+FF0F (full-width !"#$%&'()*+,-./) and U+FF1F (？)
-                    p += 3;
-                } else {
-                    return false;
-                }
-            }
-            return true;
-        };
-
-        // Punct-token timestamp refinement (NeMo's _refine_timestamps_tdt).
-        // The TDT decoder often emits "." / "?" / "!" several frames AFTER
-        // the audible end of the preceding word — the model "saves" the
-        // punct prediction across silence. Without refinement, the period
-        // glued onto the previous word in word-grouping pulls word.t1
-        // hundreds of ms past the actual end of the spoken word, which
-        // shows up in readalong as the highlight lingering on the last
-        // word of a sentence.
-        //
-        // NeMo handles this by snapping each punct token's [start,end] to
-        // [prev.end, prev.end] before grouping. Mirror that here in place
-        // on r->tokens so the grouper's cur.t1 update naturally lands on
-        // the previous (non-punct) token's end.
-        for (int i = 1; i < r->n_tokens; i++) {
-            if (is_punct_only(r->tokens[i].text)) {
-                r->tokens[i].t0 = r->tokens[i - 1].t1;
-                r->tokens[i].t1 = r->tokens[i - 1].t1;
-            }
-        }
-
-        // True end-of-sentence punct (for the gap-insertion pass below).
-        auto ends_with_sentence_punct = [](const char* s) {
-            size_t len = s ? strlen(s) : 0;
-            if (len == 0)
-                return false;
-            unsigned char last = (unsigned char)s[len - 1];
-            if (last == '.' || last == '!' || last == '?')
-                return true;
-            if (len >= 3) {
-                const unsigned char* tail = (const unsigned char*)(s + len - 3);
-                // U+3002 。 = E3 80 82, U+FF01 ！ = EF BC 81, U+FF1F ？ = EF BC 9F
-                if (tail[0] == 0xE3 && tail[1] == 0x80 && tail[2] == 0x82)
-                    return true;
-                if (tail[0] == 0xEF && tail[1] == 0xBC && (tail[2] == 0x81 || tail[2] == 0x9F))
-                    return true;
-            }
-            return false;
-        };
-
-        parakeet_word_data cur = {};
-        bool have_cur = false;
-        // Per-word probability: arithmetic mean of contributing tokens'
-        // softmax probabilities. Tracked alongside `cur`.
-        float cur_p_sum = 0.0f;
-        int cur_p_cnt = 0;
-
-        auto flush_cur = [&]() {
-            if (cur_p_cnt > 0)
-                cur.p = cur_p_sum / (float)cur_p_cnt;
-            words.push_back(cur);
-        };
-
-        for (int i = 0; i < r->n_tokens; i++) {
-            const auto& td = r->tokens[i];
-            if (!td.text[0])
-                continue;
-            // A standalone "▁" piece (vis=" ") is a SentencePiece word boundary
-            // emitted as its own token — common between a word like "April" and
-            // a digit like "2" because the vocab has no "▁2" entry. It must
-            // flush the current word so the digit doesn't glue onto it
-            // ("April 2nd" not "April2nd"); but it carries no characters of its
-            // own so we don't start a new word from it.
-            if (td.text[0] == ' ' && td.text[1] == '\0') {
-                if (have_cur) {
-                    flush_cur();
-                    cur = {};
-                    cur_p_sum = 0.0f;
-                    cur_p_cnt = 0;
-                    have_cur = false;
-                }
-                continue;
-            }
-
-            const bool has_leading_space = (td.text[0] == ' ');
-            const bool is_punct = is_punct_only(td.text);
-
-            // A token starts a new word if either:
-            //   - it has a Latin-style leading-space marker, or
-            //   - the segment is no-space style (e.g. JA) and the token
-            //     is not pure punctuation (so 、 attaches to prev word).
-            const bool is_new_word = !is_punct && (has_leading_space || !space_prefix_style);
-
-            if (is_new_word && have_cur) {
-                flush_cur();
-                cur = {};
-                cur_p_sum = 0.0f;
-                cur_p_cnt = 0;
-                have_cur = false;
-            }
-
-            if (!have_cur) {
-                cur.t0 = td.t0;
-                have_cur = true;
-            }
-            cur.t1 = td.t1;
-            cur_p_sum += td.p;
-            cur_p_cnt += 1;
-
-            // Append, dropping the leading space.
-            const char* src = td.text + (has_leading_space ? 1 : 0);
-            size_t cur_len = strlen(cur.text);
-            size_t cap = sizeof(cur.text) - cur_len - 1;
-            size_t add = strlen(src);
-            if (add > cap)
-                add = cap;
-            memcpy(cur.text + cur_len, src, add);
-            cur.text[cur_len + add] = '\0';
-        }
-        if (have_cur)
-            flush_cur();
-
-        // Post-process: insert minimum gaps after sentence-ending punctuation.
-        // The TDT decoder often produces contiguous timestamps even across
-        // sentence boundaries (e.g. "code." t1==6.400, "In" t0==6.400).
-        // When a word ends with .!?。！？ and the next word starts at the
-        // exact same frame, shrink the punctuated word's t1 by one frame
-        // duration to create a visible gap in subtitles.
-        for (size_t wi = 0; wi + 1 < words.size(); wi++) {
-            if (!ends_with_sentence_punct(words[wi].text))
-                continue;
-            if (words[wi].t1 >= words[wi + 1].t0 && words[wi].t1 > words[wi].t0) {
-                int64_t shrunk = words[wi].t1 - frame_dur_cs;
-                if (shrunk > words[wi].t0)
-                    words[wi].t1 = shrunk;
-            }
-        }
-
-        r->n_words = (int)words.size();
-        r->words = (parakeet_word_data*)calloc(r->n_words > 0 ? r->n_words : 1, sizeof(parakeet_word_data));
-        for (int i = 0; i < r->n_words; i++)
-            r->words[i] = words[i];
-    }
-
-    return r;
+    return parakeet_build_result(ctx, emitted, t_offset_cs, /*strip_leading_space=*/true);
 }
 
 extern "C" char* parakeet_transcribe(struct parakeet_context* ctx, const float* samples, int n_samples) {
@@ -3286,3 +3309,222 @@ extern "C" char* parakeet_transcribe(struct parakeet_context* ctx, const float* 
     parakeet_result_free(r);
     return out;
 }
+
+// ===========================================================================
+// Windowed streaming. See parakeet.h. Frames are on the encoder grid (hop * subsampling samples,
+// 80 ms); every window starts on that grid so window-local frame i is absolute frame ws + i.
+// ===========================================================================
+
+struct parakeet_stream {
+    int F = 0; // samples per encoder frame
+    int64_t chunk_f = 0, right_f = 0, left_f = 0;
+    std::vector<float> buf; // samples from absolute index buf_start
+    int64_t buf_start = 0;
+    int64_t n_total = 0;
+    int64_t done_f = 0; // chunk grid decoded up to
+    int64_t t_next = 0; // absolute frame the decoder resumes at (>= done_f after an overshoot)
+    bool started = false, finished = false;
+    std::vector<float> h0, c0, h1, c1; // predictor state between feeds
+    std::vector<parakeet_emitted_token> open_word; // tokens of the trailing, possibly unfinished word
+    int n_word_starts = 0; // space-prefixed tokens so far: decides word grouping style like whole-file
+    std::vector<float> enc;            // last window's encoder output (for the provisional decode)
+    int64_t enc_ws = 0;
+    int enc_T = 0;
+};
+
+extern "C" struct parakeet_stream_params parakeet_stream_default_params(void) {
+    return {0.64f, 0.64f, 10.0f};
+}
+
+extern "C" struct parakeet_stream* parakeet_stream_begin(struct parakeet_context* ctx,
+                                                         struct parakeet_stream_params p) {
+    if (!ctx)
+        return nullptr;
+    const auto& hp = ctx->model.hparams;
+    auto* st = new parakeet_stream();
+    st->F = (int)hp.hop_length * (int)hp.subsampling_factor;
+    const double fs = (double)st->F / 16000.0;
+    st->chunk_f = std::max<int64_t>(1, (int64_t)std::lround(p.chunk_sec / fs));
+    st->right_f = std::max<int64_t>(0, (int64_t)std::lround(p.right_sec / fs));
+    st->left_f = std::max<int64_t>(0, (int64_t)std::lround(p.left_sec / fs));
+    return st;
+}
+
+extern "C" void parakeet_stream_free(struct parakeet_stream* st) {
+    delete st;
+}
+
+static void stream_state_io(parakeet_context* ctx, parakeet_stream* st, bool save) {
+    auto& s = ctx->tdt_gpu;
+    const size_t H = (size_t)ctx->model.hparams.pred_hidden;
+    std::pair<ggml_tensor*, std::vector<float>*> v[] = {{s.h0, &st->h0}, {s.c0, &st->c0}, {s.h1, &st->h1},
+                                                         {s.c1, &st->c1}};
+    for (auto& [t, host] : v) {
+        if (save) {
+            host->resize(H);
+            ggml_backend_tensor_get(t, host->data(), 0, H * sizeof(float));
+        } else {
+            ggml_backend_tensor_set(t, host->data(), 0, H * sizeof(float));
+        }
+    }
+}
+
+// mel + encoder over a sample span; returns [T_enc, d_model].
+static std::vector<float> stream_encode(parakeet_context* ctx, const float* samples, int n_samples, int* T_enc) {
+    int T_mel = 0;
+    std::vector<float> mel = parakeet_compute_mel_gpu(ctx, samples, n_samples, T_mel);
+    if (mel.empty() && !ctx->mel_gpu.ever_used)
+        mel = parakeet_compute_mel_impl(ctx, samples, n_samples, T_mel);
+    if (mel.empty())
+        return {};
+    const auto& hp = ctx->model.hparams;
+    const int T_valid_enc = n_samples / (int)hp.hop_length / (int)hp.subsampling_factor;
+    return parakeet_encode_mel(ctx, mel.data(), (int)hp.n_mels, T_mel, T_enc, T_valid_enc);
+}
+
+extern "C" struct parakeet_result* parakeet_stream_feed(struct parakeet_context* ctx, struct parakeet_stream* st,
+                                                        const float* samples, int n_samples, int final,
+                                                        int partial_mode, char** out_partial) {
+    if (partial_mode == 0)
+        out_partial = nullptr;
+    if (out_partial)
+        *out_partial = nullptr;
+    if (!ctx || !st || st->finished || n_samples < 0)
+        return nullptr;
+    if (n_samples > 0)
+        st->buf.insert(st->buf.end(), samples, samples + n_samples);
+    st->n_total += n_samples;
+
+    const int d_model = (int)ctx->model.hparams.d_model;
+    const int64_t F = st->F;
+    std::vector<parakeet_emitted_token> out;
+
+    if (!st->started) {
+        if (!tdt_gpu_start(ctx, nullptr)) {
+            fprintf(stderr, "parakeet: stream needs the GPU TDT decoder\n");
+            return nullptr;
+        }
+        st->started = true;
+    } else {
+        stream_state_io(ctx, st, /*save=*/false);
+    }
+
+    for (;;) {
+        const int64_t need_f = st->done_f + st->chunk_f + st->right_f;
+        const bool full = st->n_total / F >= need_f;
+        if (!full && !(final && st->done_f * F < st->n_total))
+            break;
+        const bool last = !full;
+        const int64_t ws = std::max<int64_t>(0, st->done_f - st->left_f);
+        const int64_t we = last ? st->n_total : need_f * F;
+        int T = 0;
+        std::vector<float> enc = stream_encode(ctx, st->buf.data() + (ws * F - st->buf_start), (int)(we - ws * F), &T);
+        if (enc.empty())
+            return nullptr;
+        const int local_stop = last ? T : (int)std::min<int64_t>(T, st->done_f + st->chunk_f - ws);
+        const int local_t = (int)(st->t_next - ws);
+        if (local_t < local_stop) {
+            const size_t n0 = out.size();
+            const int tn = tdt_gpu_decode_range(ctx, enc.data(), T, d_model, local_t, local_stop, out, nullptr);
+            if (tn < 0)
+                return nullptr;
+            for (size_t i = n0; i < out.size(); i++) {
+                out[i].t_start += (int)ws;
+                out[i].t_end += (int)ws;
+            }
+            st->t_next = ws + tn;
+        }
+        st->enc = std::move(enc);
+        st->enc_ws = ws;
+        st->enc_T = T;
+        if (last) {
+            st->done_f = (st->n_total + F - 1) / F;
+            st->finished = true;
+            break;
+        }
+        st->done_f += st->chunk_f;
+    }
+
+    // Drop audio no future window can reach.
+    const int64_t keep_from = std::max<int64_t>(0, st->done_f - st->left_f) * F;
+    if (keep_from > st->buf_start) {
+        const int64_t drop = std::min<int64_t>(keep_from - st->buf_start, (int64_t)st->buf.size());
+        st->buf.erase(st->buf.begin(), st->buf.begin() + drop);
+        st->buf_start += drop;
+    }
+
+    // Provisional: decode the uncommitted tail from a copy of the state, then roll back. The
+    // cheap form reuses the last window's lookahead; the fresh form (partial_mode 2) first
+    // re-encodes a window ending at the newest sample so the tail reaches "now".
+    if (out_partial && partial_mode == 2 && !st->finished && st->n_total > st->t_next * F) {
+        const int64_t ws = std::max<int64_t>(0, st->done_f - st->left_f);
+        int T = 0;
+        std::vector<float> enc =
+            stream_encode(ctx, st->buf.data() + (ws * F - st->buf_start), (int)(st->n_total - ws * F), &T);
+        if (!enc.empty()) {
+            st->enc = std::move(enc);
+            st->enc_ws = ws;
+            st->enc_T = T;
+        }
+    }
+    if (out_partial && !st->finished && !st->enc.empty()) {
+        stream_state_io(ctx, st, /*save=*/true);
+        const int local_t = (int)(st->t_next - st->enc_ws);
+        std::string ptext;
+        if (local_t < st->enc_T) {
+            std::vector<parakeet_emitted_token> prov;
+            if (tdt_gpu_decode_range(ctx, st->enc.data(), st->enc_T, d_model, local_t, st->enc_T, prov, nullptr) >= 0) {
+                for (const auto& e : prov)
+                    if (e.id >= 0 && e.id < (int)ctx->vocab.id_to_token.size())
+                        ptext += spiece_to_text(ctx->vocab.id_to_token[e.id]);
+            }
+        }
+        *out_partial = strdup(ptext.c_str());
+        stream_state_io(ctx, st, /*save=*/false);
+    } else if (!st->finished) {
+        stream_state_io(ctx, st, /*save=*/true);
+    }
+
+    // Text goes out immediately; words only once closed (next word-start token, or the flush), so
+    // a word split across two chunks ("plan" | "ks") is reported whole.
+    for (const auto& e : out)
+        if (e.id >= 0 && e.id < (int)ctx->vocab.id_to_token.size()) {
+            const std::string v = spiece_to_text(ctx->vocab.id_to_token[e.id]);
+            if (v.size() > 1 && v[0] == ' ')
+                st->n_word_starts++;
+        }
+    std::vector<parakeet_emitted_token> wt = std::move(st->open_word);
+    wt.insert(wt.end(), out.begin(), out.end());
+    st->open_word.clear();
+    if (!st->finished) {
+        size_t k = wt.size();
+        while (k > 0) {
+            const auto& e = wt[k - 1];
+            const bool starts_word = e.id >= 0 && e.id < (int)ctx->vocab.id_to_token.size() &&
+                                     spiece_to_text(ctx->vocab.id_to_token[e.id]).rfind(' ', 0) == 0;
+            k--;
+            if (starts_word)
+                break;
+        }
+        st->open_word.assign(wt.begin() + (long)k, wt.end());
+        wt.resize(k);
+    }
+    parakeet_result* r = parakeet_build_result(ctx, wt, 0, /*strip_leading_space=*/false, st->n_word_starts >= 2);
+    parakeet_result* rt = parakeet_build_result(ctx, out, 0, /*strip_leading_space=*/false);
+    if (!r || !rt) {
+        parakeet_result_free(r);
+        parakeet_result_free(rt);
+        return nullptr;
+    }
+    free(r->text);
+    r->text = rt->text;
+    rt->text = nullptr;
+    free(r->tokens);
+    r->tokens = rt->tokens;
+    r->n_tokens = rt->n_tokens;
+    rt->tokens = nullptr;
+    rt->n_tokens = 0;
+    parakeet_result_free(rt);
+    return r;
+}
+

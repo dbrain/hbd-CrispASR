@@ -88,6 +88,35 @@ const char* parakeet_token_to_str(struct parakeet_context* ctx, int token_id);
 // until the next call. seed == 0 means time-based RNG.
 void parakeet_set_temperature(struct parakeet_context* ctx, float temperature, uint64_t seed);
 
+// ---- Windowed streaming (buffered, bounded window) ----
+//
+// Audio is cut on a fixed grid of chunk_sec. Each chunk is encoded inside a window of
+// [left_sec of history | chunk | right_sec of lookahead] with full attention, only the chunk's
+// frames are decoded, and the TDT predictor state carries across chunks, so text is final once
+// returned. Latency ~= chunk + right context + compute. Accuracy falls off sharply below ~0.64 s
+// of right context. The caller serialises calls per context; several streams may share one
+// context (each keeps its own predictor state).
+struct parakeet_stream_params {
+    float chunk_sec; // decode grid (default 0.64)
+    float right_sec; // lookahead the chunk sees (default 0.64)
+    float left_sec;  // history the chunk sees (default 10.0)
+};
+struct parakeet_stream;
+struct parakeet_stream_params parakeet_stream_default_params(void);
+struct parakeet_stream* parakeet_stream_begin(struct parakeet_context* ctx, struct parakeet_stream_params params);
+// Append 16 kHz mono PCM. Returns the text/tokens committed by this call (possibly none; times
+// are absolute from the stream start, text keeps its leading space so deltas concatenate). Words
+// lag by up to one word: the trailing word is reported once the next word starts, or on the
+// flush, so a word cut by a chunk edge arrives whole. final=1 flushes the tail.
+// partial_mode 1: *out_partial receives a malloc'd provisional transcript of the audio not yet
+// committed, from the last window's lookahead (free). partial_mode 2: same, but re-encodes a
+// window ending at the newest sample first (one extra encoder pass) so the text reaches "now";
+// ask for it when the speaker goes quiet. 0: no partial. Returns NULL on error.
+struct parakeet_result* parakeet_stream_feed(struct parakeet_context* ctx, struct parakeet_stream* st,
+                                             const float* samples, int n_samples, int final, int partial_mode,
+                                             char** out_partial);
+void parakeet_stream_free(struct parakeet_stream* st);
+
 // Hyper-parameters needed by callers (frame duration for stamping etc.)
 int parakeet_frame_dur_cs(struct parakeet_context* ctx); // centiseconds per encoder frame
 int parakeet_n_mels(struct parakeet_context* ctx);
