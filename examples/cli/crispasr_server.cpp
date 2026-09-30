@@ -47,6 +47,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -277,7 +278,8 @@ static bool check_cancel(const std::string& cancel_url) {
 // worker) reclaims VRAM the same way regardless of mode.
 static transcription_result do_transcribe(const std::string& audio_path, CrispasrBackend* backend,
                                           crispasr::WorkerSession* worker, std::mutex& model_mutex,
-                                          whisper_params rp, const std::string& cancel_url) {
+                                          std::shared_mutex& file_jobs, whisper_params rp,
+                                          const std::string& cancel_url) {
     transcription_result result;
     result.language = rp.language;
 
@@ -315,6 +317,9 @@ static transcription_result do_transcribe(const std::string& audio_path, Crispas
     // Worker mode takes model_mutex per chunk, not per file, so live /v1/stream feeds interleave
     // with a long file job and wait at most one chunk. In-process mode holds it for the whole file:
     // /unload frees `backend` outright, and this raw pointer must not outlive it mid-file.
+    // file_jobs (shared here, exclusive in /unload, /load and the idle watchdog) keeps the old
+    // guarantee that an unload waits for a running file job instead of landing between chunks.
+    std::shared_lock<std::shared_mutex> job_lock(file_jobs);
     std::unique_lock<std::mutex> file_lock(model_mutex, std::defer_lock);
     if (!worker)
         file_lock.lock();
@@ -402,6 +407,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
 
     std::unique_ptr<CrispasrBackend> backend;
     std::mutex model_mutex;
+    std::shared_mutex file_jobs; // see do_transcribe; lock order: file_jobs before model_mutex
     std::atomic<bool> ready{false};
     // model_loaded distinguishes "we have a backend instance holding GPU
     // memory" from ready (which goes false during /load swaps as well).
@@ -708,7 +714,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         rp.language = form_string(req, "language", rp.language);
 
         const std::string cancel_url = form_string(req, "cancel_url");
-        auto result = do_transcribe(audio_path, backend.get(), worker.get(), model_mutex, rp, cancel_url);
+        auto result = do_transcribe(audio_path, backend.get(), worker.get(), model_mutex, file_jobs, rp, cancel_url);
         if (tmp_owned)
             std::remove(audio_path.c_str());
 
@@ -813,7 +819,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         if (!prompt.empty())
             rp.prompt = prompt;
 
-        auto result = do_transcribe(audio_path, backend.get(), worker.get(), model_mutex, rp, cancel_url);
+        auto result = do_transcribe(audio_path, backend.get(), worker.get(), model_mutex, file_jobs, rp, cancel_url);
         if (tmp_owned)
             std::remove(audio_path.c_str());
 
@@ -861,6 +867,9 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     //
     // Streams live in the worker, so a worker restart (unload, GPU relocation, crash) ends them:
     // feeds then get 410 and the client opens a new stream. Streams idle for 120 s are dropped.
+    // While any stream is live, /unload answers 409 unless ?force=1 (keeps the GPU gate off it).
+    // Feed bodies must be sent as application/octet-stream: httplib caps form-encoded bodies
+    // (curl --data-binary's default) at 8 KiB.
     // Feeds share model_mutex with file transcription, which takes it per 30 s chunk, so a feed
     // waits at most one chunk behind a long file job.
     // -----------------------------------------------------------------------
@@ -908,6 +917,17 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         return {{"text", d.text}, {"partial", d.partial}, {"words", words}};
     };
     auto current_pid = [&]() -> pid_t { return worker ? worker->pid() : 0; };
+    // Streams fed within the last 120 s on the current worker; drops the rest from the table.
+    auto live_stream_count = [&]() -> int {
+        std::lock_guard<std::mutex> lk(streams_mutex);
+        for (auto it = streams.begin(); it != streams.end();) {
+            if (now_ms() - it->second.last_ms > 120000 || it->second.worker_pid != current_pid())
+                it = streams.erase(it);
+            else
+                ++it;
+        }
+        return (int)streams.size();
+    };
 
     svr.Post("/v1/stream", [&](const Request& req, Response& res) {
         if (!require_auth(req, res))
@@ -1045,6 +1065,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     svr.Post("/load", [&](const Request& req, Response& res) {
         if (!require_auth(req, res))
             return;
+        std::unique_lock<std::shared_mutex> jobs(file_jobs);
         std::lock_guard<std::mutex> lock(model_mutex);
 
         std::string new_model = form_string(req, "model");
@@ -1109,6 +1130,14 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     svr.Post("/unload", [&](const Request& req, Response& res) {
         if (!require_auth(req, res))
             return;
+        // Live streams die with the worker, so refuse unless forced. The GPU gate reads only the
+        // status code: a 409 keeps STT resident while someone is mid-conversation.
+        const int n_live = live_stream_count();
+        if (n_live > 0 && req.get_param_value("force") != "1") {
+            json_error(res, 409, std::to_string(n_live) + " live stream(s) open; POST /unload?force=1 to kill them");
+            return;
+        }
+        std::unique_lock<std::shared_mutex> jobs(file_jobs);
         std::lock_guard<std::mutex> lock(model_mutex);
         free_backend_locked();
         res.set_content("{\"status\": \"unloaded\"}", "application/json");
@@ -1520,6 +1549,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
                     continue; // never received a request — leave loaded
                 if ((now_ms - last) >= (int64_t)idle_unload_seconds * 1000) {
                     fprintf(stderr, "crispasr-server: idle %ds since last request — unloading\n", idle_unload_seconds);
+                    std::unique_lock<std::shared_mutex> jobs(file_jobs);
                     std::lock_guard<std::mutex> lock(model_mutex);
                     free_backend_locked();
                 }
