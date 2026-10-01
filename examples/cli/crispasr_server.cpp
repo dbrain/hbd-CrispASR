@@ -926,7 +926,8 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         return {{"text", d.text},
                 {"partial", d.partial},
                 {"words", words},
-                {"windows", {{"encoded", d.n_encoded}, {"skipped", d.n_skipped}, {"gated", d.gated}}}};
+                {"windows", {{"encoded", d.n_encoded}, {"skipped", d.n_skipped}, {"gated", d.gated}}},
+                {"speech", stream_speech_json<sjson>(d)}};
     };
     auto current_pid = [&]() -> pid_t { return worker ? worker->pid() : 0; };
     // Streams fed within the last 120 s on the current worker; drops the rest from the table.
@@ -1001,7 +1002,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             std::lock_guard<std::mutex> lk(streams_mutex);
             streams[id] = {sid, pid, now_ms()};
         }
-        res.set_content(sjson({{"id", id}}).dump(), "application/sjson");
+        res.set_content(sjson({{"id", id}}).dump(), "application/json");
     });
 
     svr.Post(R"(/v1/stream/([\w-]+)/audio)", [&](const Request& req, Response& res) {
@@ -1052,7 +1053,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             return;
         }
         r["done"] = final;
-        res.set_content(r.dump(), "application/sjson");
+        res.set_content(r.dump(), "application/json");
     });
 
     svr.Delete(R"(/v1/stream/([\w-]+))", [&](const Request& req, Response& res) {
@@ -1075,7 +1076,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             if (model_loaded.load() && current_pid() == ls.worker_pid)
                 stream_op({{"op", "end"}, {"sid", ls.sid}}, nullptr, 0);
         }
-        res.set_content("{\"ok\":true}", "application/sjson");
+        res.set_content("{\"ok\":true}", "application/json");
     });
 
     // -----------------------------------------------------------------------

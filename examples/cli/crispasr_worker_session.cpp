@@ -1038,7 +1038,8 @@ int run_worker_loop(int fd) {
                 for (const auto& w : d.words)
                     words.push_back({{"word", w.text}, {"start", w.t0 / 100.0}, {"end", w.t1 / 100.0}});
                 out = {{"text", d.text}, {"partial", d.partial}, {"words", words},
-                       {"windows", {{"encoded", d.n_encoded}, {"skipped", d.n_skipped}, {"gated", d.gated}}}};
+                       {"windows", {{"encoded", d.n_encoded}, {"skipped", d.n_skipped}, {"gated", d.gated}}},
+                {"speech", stream_speech_json<json>(d)}};
             } else if (op == "end") {
                 backend->stream_end(sid);
             } else {

@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -104,7 +105,23 @@ struct crispasr_stream_delta {
     std::vector<crispasr_word> words; // committed words, absolute times from the stream start
     int n_encoded = 0, n_skipped = 0; // windows so far (skipped = speech gate found no speech)
     bool gated = false;               // a speech gate is active on this stream
+    // Voice activity, independent of the gate: seconds of audio fed so far, and where the most
+    // recent speech ends on that clock (-1 = none yet, or no VAD). Lets callers time pauses
+    // without running their own VAD.
+    double audio_sec = 0.0;
+    double speech_end = -1.0;
 };
+
+// `speech` object of a stream response: audio_sec, speech_end (null = none yet / no VAD),
+// silence_sec (trailing silence; null when speech_end is). J = any nlohmann::basic_json.
+template <class J> J stream_speech_json(const crispasr_stream_delta& d) {
+    J s = {{"audio_sec", d.audio_sec}, {"speech_end", nullptr}, {"silence_sec", nullptr}};
+    if (d.speech_end >= 0.0) {
+        s["speech_end"] = d.speech_end;
+        s["silence_sec"] = std::max(0.0, d.audio_sec - d.speech_end);
+    }
+    return s;
+}
 
 // ---------------------------------------------------------------------------
 // Backend interface

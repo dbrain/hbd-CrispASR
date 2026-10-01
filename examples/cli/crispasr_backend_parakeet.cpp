@@ -122,7 +122,10 @@ public:
         sp.right_sec = o.right_sec;
         sp.left_sec = o.left_sec;
         auto gate = std::make_unique<SpeechGate>();
-        if (o.vad_threshold > 0.0f && (vad_ = vad_ ? vad_ : load_vad())) {
+        if (!vad_ && !vad_missing_)
+            vad_missing_ = !(vad_ = load_vad());
+        gate->activity_threshold = o.vad_threshold > 0.0f ? o.vad_threshold : activity_threshold();
+        if (o.vad_threshold > 0.0f && vad_) {
             gate->vad = vad_;
             gate->threshold = o.vad_threshold;
             sp.speech_fn = &SpeechGate::call;
@@ -155,10 +158,18 @@ public:
         }
         d.ok = true;
         parakeet_stream_stats(it->second, &d.n_encoded, &d.n_skipped);
-        d.gated = gates_.count(sid) && gates_[sid]->vad;
+        SpeechGate& g = *gates_[sid];
+        d.gated = g.vad != nullptr;
+        track_activity(g, samples, n_samples);
+        d.audio_sec = (double)g.total / 16000.0;
         d.text = r->text ? r->text : "";
-        for (int i = 0; i < r->n_words; i++)
+        for (int i = 0; i < r->n_words; i++) {
             d.words.push_back({r->words[i].text, r->words[i].t0, r->words[i].t1});
+            // Committed words also count as speech: quiet talkers the VAD misses still get
+            // transcribed (they just arrive ~1 s late).
+            g.speech_end = std::max(g.speech_end, r->words[i].t1 / 100.0);
+        }
+        d.speech_end = g.speech_end;
         if (ptext)
             d.partial = ptext;
         free(ptext);
@@ -195,8 +206,13 @@ public:
 private:
     // Speech gate for live streams: FireRedVAD (DFSMN, 588K params, CPU) over the chunk + lookahead.
     struct SpeechGate {
-        firered_vad_context* vad = nullptr;
+        firered_vad_context* vad = nullptr; // set only when gating
         float threshold = 0.0f;
+        // Activity tracking (always on when a VAD model is present).
+        float activity_threshold = 0.3f;
+        std::vector<float> ctx; // last kActivityCtx samples, re-scanned with each feed
+        int64_t total = 0;      // samples fed
+        double speech_end = -1.0;
         static int call(const float* samples, int n, void* user) {
             auto* g = static_cast<SpeechGate*>(user);
             firered_vad_segment* segs = nullptr;
@@ -208,13 +224,50 @@ private:
         }
     };
 
+    static constexpr size_t kActivityCtx = 16000; // 1 s: FireRedVAD needs context to place edges
+
+    // PARAKEET_STREAM_ACTIVITY_THRESHOLD (default 0.3): VAD threshold for speech_end when the
+    // stream has no gate threshold of its own.
+    static float activity_threshold() {
+        static const float t = []() {
+            const char* e = std::getenv("PARAKEET_STREAM_ACTIVITY_THRESHOLD");
+            return e && *e ? (float)std::atof(e) : 0.3f;
+        }();
+        return t;
+    }
+
+    // Scans [1 s of earlier audio + this feed] and moves speech_end to the end of the latest
+    // speech found. A segment reaching the buffer end means speech is still going.
+    void track_activity(SpeechGate& g, const float* samples, int n) {
+        if (n <= 0)
+            return;
+        const int64_t base = g.total - (int64_t)g.ctx.size();
+        g.ctx.insert(g.ctx.end(), samples, samples + n);
+        g.total += n;
+        if (vad_) {
+            firered_vad_segment* segs = nullptr;
+            int n_segs = 0;
+            if (firered_vad_detect(vad_, g.ctx.data(), (int)g.ctx.size(), &segs, &n_segs, g.activity_threshold,
+                                   0.05f, 0.1f) == 0) {
+                const double buf_sec = (double)g.ctx.size() / 16000.0;
+                for (int i = 0; i < n_segs; i++) {
+                    const double e = segs[i].end_sec >= buf_sec - 0.05 ? buf_sec : segs[i].end_sec;
+                    g.speech_end = std::max(g.speech_end, (double)base / 16000.0 + e);
+                }
+                free(segs);
+            }
+        }
+        if (g.ctx.size() > kActivityCtx)
+            g.ctx.erase(g.ctx.begin(), g.ctx.end() - kActivityCtx);
+    }
+
     // PARAKEET_STREAM_VAD_MODEL, default /models/firered-vad.gguf. Missing → streams run ungated.
     static firered_vad_context* load_vad() {
         const char* env = std::getenv("PARAKEET_STREAM_VAD_MODEL");
         const char* path = env && *env ? env : "/models/firered-vad.gguf";
         firered_vad_context* v = firered_vad_init(path);
         if (!v)
-            fprintf(stderr, "crispasr[parakeet]: stream speech gate off — no VAD model at '%s'\n", path);
+            fprintf(stderr, "crispasr[parakeet]: stream speech gate and activity off — no VAD model at '%s'\n", path);
         return v;
     }
 
@@ -222,6 +275,7 @@ private:
     std::map<uint32_t, parakeet_stream*> streams_;
     std::map<uint32_t, std::unique_ptr<SpeechGate>> gates_;
     firered_vad_context* vad_ = nullptr;
+    bool vad_missing_ = false;
 };
 
 } // namespace
