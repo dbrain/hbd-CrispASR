@@ -10,10 +10,13 @@
 #include "whisper_params.h"
 
 #include "parakeet.h"
+#include "firered_vad.h"
 
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <map>
+#include <memory>
 
 namespace {
 
@@ -118,10 +121,18 @@ public:
         sp.chunk_sec = o.chunk_sec;
         sp.right_sec = o.right_sec;
         sp.left_sec = o.left_sec;
+        auto gate = std::make_unique<SpeechGate>();
+        if (o.vad_threshold > 0.0f && (vad_ = vad_ ? vad_ : load_vad())) {
+            gate->vad = vad_;
+            gate->threshold = o.vad_threshold;
+            sp.speech_fn = &SpeechGate::call;
+            sp.speech_user = gate.get();
+        }
         parakeet_stream* st = parakeet_stream_begin(ctx_, sp);
         if (!st)
             return false;
         streams_[sid] = st;
+        gates_[sid] = std::move(gate);
         return true;
     }
 
@@ -135,14 +146,16 @@ public:
         }
         char* ptext = nullptr;
         parakeet_result* r = parakeet_stream_feed(ctx_, it->second, samples, n_samples, final ? 1 : 0, partial, &ptext);
-        if (final)
-            stream_end(sid);
         if (!r) {
+            if (final)
+                stream_end(sid);
             free(ptext);
             d.error = "stream decode failed";
             return d;
         }
         d.ok = true;
+        parakeet_stream_stats(it->second, &d.n_encoded, &d.n_skipped);
+        d.gated = gates_.count(sid) && gates_[sid]->vad;
         d.text = r->text ? r->text : "";
         for (int i = 0; i < r->n_words; i++)
             d.words.push_back({r->words[i].text, r->words[i].t0, r->words[i].t1});
@@ -150,6 +163,8 @@ public:
             d.partial = ptext;
         free(ptext);
         parakeet_result_free(r);
+        if (final)
+            stream_end(sid);
         return d;
     }
 
@@ -159,12 +174,18 @@ public:
             parakeet_stream_free(it->second);
             streams_.erase(it);
         }
+        gates_.erase(sid);
     }
 
     void shutdown() override {
         for (auto& [sid, st] : streams_)
             parakeet_stream_free(st);
         streams_.clear();
+        gates_.clear();
+        if (vad_) {
+            firered_vad_free(vad_);
+            vad_ = nullptr;
+        }
         if (ctx_) {
             parakeet_free(ctx_);
             ctx_ = nullptr;
@@ -172,8 +193,35 @@ public:
     }
 
 private:
+    // Speech gate for live streams: FireRedVAD (DFSMN, 588K params, CPU) over the chunk + lookahead.
+    struct SpeechGate {
+        firered_vad_context* vad = nullptr;
+        float threshold = 0.0f;
+        static int call(const float* samples, int n, void* user) {
+            auto* g = static_cast<SpeechGate*>(user);
+            firered_vad_segment* segs = nullptr;
+            int n_segs = 0;
+            if (firered_vad_detect(g->vad, samples, n, &segs, &n_segs, g->threshold, 0.05f, 0.1f) != 0)
+                return 1; // VAD failure: decode rather than drop speech
+            free(segs);
+            return n_segs > 0;
+        }
+    };
+
+    // PARAKEET_STREAM_VAD_MODEL, default /models/firered-vad.gguf. Missing → streams run ungated.
+    static firered_vad_context* load_vad() {
+        const char* env = std::getenv("PARAKEET_STREAM_VAD_MODEL");
+        const char* path = env && *env ? env : "/models/firered-vad.gguf";
+        firered_vad_context* v = firered_vad_init(path);
+        if (!v)
+            fprintf(stderr, "crispasr[parakeet]: stream speech gate off — no VAD model at '%s'\n", path);
+        return v;
+    }
+
     parakeet_context* ctx_ = nullptr;
     std::map<uint32_t, parakeet_stream*> streams_;
+    std::map<uint32_t, std::unique_ptr<SpeechGate>> gates_;
+    firered_vad_context* vad_ = nullptr;
 };
 
 } // namespace

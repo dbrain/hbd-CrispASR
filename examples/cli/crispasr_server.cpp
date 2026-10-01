@@ -408,6 +408,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     std::unique_ptr<CrispasrBackend> backend;
     std::mutex model_mutex;
     std::shared_mutex file_jobs; // see do_transcribe; lock order: file_jobs before model_mutex
+    std::atomic<int> file_jobs_active{0}; // reported as "busy" in /v1/gpu/status
     std::atomic<bool> ready{false};
     // model_loaded distinguishes "we have a backend instance holding GPU
     // memory" from ready (which goes false during /load swaps as well).
@@ -714,7 +715,9 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         rp.language = form_string(req, "language", rp.language);
 
         const std::string cancel_url = form_string(req, "cancel_url");
+        file_jobs_active++;
         auto result = do_transcribe(audio_path, backend.get(), worker.get(), model_mutex, file_jobs, rp, cancel_url);
+        file_jobs_active--;
         if (tmp_owned)
             std::remove(audio_path.c_str());
 
@@ -819,7 +822,9 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         if (!prompt.empty())
             rp.prompt = prompt;
 
+        file_jobs_active++;
         auto result = do_transcribe(audio_path, backend.get(), worker.get(), model_mutex, file_jobs, rp, cancel_url);
+        file_jobs_active--;
         if (tmp_owned)
             std::remove(audio_path.c_str());
 
@@ -857,7 +862,10 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     // -----------------------------------------------------------------------
     // Windowed streaming (CAP_STREAM backends)
     //
-    //   POST   /v1/stream                 {chunk_sec, right_sec, left_sec} (all optional) → {"id"}
+    //   POST   /v1/stream                 {chunk_sec, right_sec, left_sec, vad_threshold} (all
+    //                                     optional) → {"id"}. vad_threshold > 0 skips windows with no
+    //                                     speech (FireRedVAD, PARAKEET_STREAM_VAD_MODEL); deltas then
+    //                                     carry "windows": {encoded, skipped, gated}
     //   POST   /v1/stream/<id>/audio      body = raw s16le 16 kHz mono PCM, any length
     //                                     ?final=1 flushes and closes; ?partial=1 adds the
     //                                     uncommitted lookahead text, ?partial=2 re-encodes up
@@ -900,6 +908,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             o.chunk_sec = meta.value("chunk_sec", o.chunk_sec);
             o.right_sec = meta.value("right_sec", o.right_sec);
             o.left_sec = meta.value("left_sec", o.left_sec);
+            o.vad_threshold = meta.value("vad_threshold", o.vad_threshold);
             if (!backend->stream_begin(sid, o))
                 return {{"error", std::string("backend '") + backend->name() + "' cannot stream"}};
             return sjson::object();
@@ -914,7 +923,10 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         sjson words = sjson::array();
         for (const auto& w : d.words)
             words.push_back({{"word", w.text}, {"start", w.t0 / 100.0}, {"end", w.t1 / 100.0}});
-        return {{"text", d.text}, {"partial", d.partial}, {"words", words}};
+        return {{"text", d.text},
+                {"partial", d.partial},
+                {"words", words},
+                {"windows", {{"encoded", d.n_encoded}, {"skipped", d.n_skipped}, {"gated", d.gated}}}};
     };
     auto current_pid = [&]() -> pid_t { return worker ? worker->pid() : 0; };
     // Streams fed within the last 120 s on the current worker; drops the rest from the table.
@@ -945,7 +957,14 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             }
         }
         sjson meta = {{"op", "begin"}};
-        for (const char* k : {"chunk_sec", "right_sec", "left_sec"})
+        // Speech gate: skip windows FireRedVAD finds no speech in. Default from
+        // PARAKEET_STREAM_VAD_THRESHOLD (0 = off); the body's vad_threshold overrides.
+        static const float vad_default = []() {
+            const char* e = std::getenv("PARAKEET_STREAM_VAD_THRESHOLD");
+            return e && *e ? (float)std::atof(e) : 0.0f;
+        }();
+        meta["vad_threshold"] = vad_default;
+        for (const char* k : {"chunk_sec", "right_sec", "left_sec", "vad_threshold"})
             if (body.contains(k) && body[k].is_number())
                 meta[k] = body[k].get<float>();
         // Drop idle streams first.
@@ -1184,8 +1203,12 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         bool loaded = model_loaded.load();
         if (worker && !worker->is_alive())
             loaded = false;
+        // busy: a live stream or a file job is using the worker. The GPU gate treats a busy
+        // resident like a held one and leaves it loaded (an idle-looking direct-API worker would
+        // otherwise be reclaimed by koblem's queue planner mid-conversation).
+        const bool busy = loaded && (file_jobs_active.load() > 0 || live_stream_count() > 0);
         std::ostringstream js;
-        js << "{\"loaded\": " << (loaded ? "true" : "false");
+        js << "{\"loaded\": " << (loaded ? "true" : "false") << ", \"busy\": " << (busy ? "true" : "false");
         if (loaded && worker && !worker->worker_gpu().empty())
             js << ", \"gpu\": \"" << crispasr_json_escape(worker->worker_gpu()) << "\"";
         else

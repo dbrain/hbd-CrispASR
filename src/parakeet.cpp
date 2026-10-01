@@ -3325,6 +3325,11 @@ struct parakeet_stream {
     int64_t t_next = 0; // absolute frame the decoder resumes at (>= done_f after an overshoot)
     bool started = false, finished = false;
     std::vector<float> h0, c0, h1, c1; // predictor state between feeds
+    parakeet_speech_fn speech_fn = nullptr;
+    void* speech_user = nullptr;
+    int hangover = 2;
+    int64_t speech_until_f = -1; // decode unconditionally up to here (hangover after the last speech)
+    int n_encoded = 0, n_skipped = 0;
     std::vector<parakeet_emitted_token> open_word; // tokens of the trailing, possibly unfinished word
     int n_word_starts = 0; // space-prefixed tokens so far: decides word grouping style like whole-file
     std::vector<float> enc;            // last window's encoder output (for the provisional decode)
@@ -3333,7 +3338,7 @@ struct parakeet_stream {
 };
 
 extern "C" struct parakeet_stream_params parakeet_stream_default_params(void) {
-    return {0.64f, 0.64f, 10.0f};
+    return {0.64f, 0.64f, 10.0f, nullptr, nullptr, 2};
 }
 
 extern "C" struct parakeet_stream* parakeet_stream_begin(struct parakeet_context* ctx,
@@ -3347,11 +3352,21 @@ extern "C" struct parakeet_stream* parakeet_stream_begin(struct parakeet_context
     st->chunk_f = std::max<int64_t>(1, (int64_t)std::lround(p.chunk_sec / fs));
     st->right_f = std::max<int64_t>(0, (int64_t)std::lround(p.right_sec / fs));
     st->left_f = std::max<int64_t>(0, (int64_t)std::lround(p.left_sec / fs));
+    st->speech_fn = p.speech_fn;
+    st->speech_user = p.speech_user;
+    st->hangover = std::max(0, p.hangover_chunks);
     return st;
 }
 
 extern "C" void parakeet_stream_free(struct parakeet_stream* st) {
     delete st;
+}
+
+extern "C" void parakeet_stream_stats(const struct parakeet_stream* st, int* n_encoded, int* n_skipped) {
+    if (n_encoded)
+        *n_encoded = st ? st->n_encoded : 0;
+    if (n_skipped)
+        *n_skipped = st ? st->n_skipped : 0;
 }
 
 static void stream_state_io(parakeet_context* ctx, parakeet_stream* st, bool save) {
@@ -3415,6 +3430,21 @@ extern "C" struct parakeet_result* parakeet_stream_feed(struct parakeet_context*
         if (!full && !(final && st->done_f * F < st->n_total))
             break;
         const bool last = !full;
+        if (st->speech_fn && !last) {
+            const int64_t g0 = std::max<int64_t>(st->buf_start, (st->done_f - 16000 / F) * F); // ~1 s context
+            const int64_t g1 = need_f * F;
+            if (st->speech_fn(st->buf.data() + (g0 - st->buf_start), (int)(g1 - g0), st->speech_user))
+                st->speech_until_f = st->done_f + (int64_t)(1 + st->hangover) * st->chunk_f;
+            if (st->done_f >= st->speech_until_f) {
+                // Silent chunk: skip the encoder. Nothing was emitted, so the decoder just moves on.
+                st->done_f += st->chunk_f;
+                st->t_next = std::max(st->t_next, st->done_f);
+                st->n_skipped++;
+                st->enc.clear(); // its lookahead was just judged silent; no stale provisional text
+                continue;
+            }
+        }
+        st->n_encoded++;
         const int64_t ws = std::max<int64_t>(0, st->done_f - st->left_f);
         const int64_t we = last ? st->n_total : need_f * F;
         int T = 0;

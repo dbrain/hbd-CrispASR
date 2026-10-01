@@ -94,6 +94,7 @@ struct crispasr_stream_opts {
     float chunk_sec = 0.64f;
     float right_sec = 0.64f;
     float left_sec = 10.0f;
+    float vad_threshold = 0.0f; // > 0: skip chunks the backend's VAD finds no speech in
 };
 struct crispasr_stream_delta {
     bool ok = false;
@@ -101,6 +102,8 @@ struct crispasr_stream_delta {
     std::string text; // committed this call, leading space kept so deltas concatenate
     std::string partial;
     std::vector<crispasr_word> words; // committed words, absolute times from the stream start
+    int n_encoded = 0, n_skipped = 0; // windows so far (skipped = speech gate found no speech)
+    bool gated = false;               // a speech gate is active on this stream
 };
 
 // ---------------------------------------------------------------------------

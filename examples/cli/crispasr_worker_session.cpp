@@ -1022,6 +1022,7 @@ int run_worker_loop(int fd) {
                 o.chunk_sec = meta.value("chunk_sec", o.chunk_sec);
                 o.right_sec = meta.value("right_sec", o.right_sec);
                 o.left_sec = meta.value("left_sec", o.left_sec);
+            o.vad_threshold = meta.value("vad_threshold", o.vad_threshold);
                 if (!backend->stream_begin(sid, o)) {
                     err_resp(hdr.req_id, std::string("backend '") + backend->name() + "' cannot stream");
                     break;
@@ -1036,7 +1037,8 @@ int run_worker_loop(int fd) {
                 json words = json::array();
                 for (const auto& w : d.words)
                     words.push_back({{"word", w.text}, {"start", w.t0 / 100.0}, {"end", w.t1 / 100.0}});
-                out = {{"text", d.text}, {"partial", d.partial}, {"words", words}};
+                out = {{"text", d.text}, {"partial", d.partial}, {"words", words},
+                       {"windows", {{"encoded", d.n_encoded}, {"skipped", d.n_skipped}, {"gated", d.gated}}}};
             } else if (op == "end") {
                 backend->stream_end(sid);
             } else {

@@ -96,10 +96,21 @@ void parakeet_set_temperature(struct parakeet_context* ctx, float temperature, u
 // returned. Latency ~= chunk + right context + compute. Accuracy falls off sharply below ~0.64 s
 // of right context. The caller serialises calls per context; several streams may share one
 // context (each keeps its own predictor state).
+// Optional speech gate: called before a chunk is encoded with the audio [chunk start - up to 1 s
+// of context, end of lookahead). Return 0 for "no speech" and the chunk is skipped (no encoder
+// pass; equivalent to decoding it as all-blank, so the predictor state is unaffected). Decoding
+// resumes as soon as speech appears in a chunk's lookahead, and every encoded window carries
+// left_sec of history, so a skipped stretch never cuts off the start of the next utterance.
+// After the last speech chunk, hangover_chunks more are decoded regardless.
+typedef int (*parakeet_speech_fn)(const float* samples, int n_samples, void* user);
+
 struct parakeet_stream_params {
     float chunk_sec; // decode grid (default 0.64)
     float right_sec; // lookahead the chunk sees (default 0.64)
     float left_sec;  // history the chunk sees (default 10.0)
+    parakeet_speech_fn speech_fn; // NULL = decode every chunk
+    void* speech_user;
+    int hangover_chunks; // default 2
 };
 struct parakeet_stream;
 struct parakeet_stream_params parakeet_stream_default_params(void);
@@ -116,6 +127,8 @@ struct parakeet_result* parakeet_stream_feed(struct parakeet_context* ctx, struc
                                              const float* samples, int n_samples, int final, int partial_mode,
                                              char** out_partial);
 void parakeet_stream_free(struct parakeet_stream* st);
+// Windows encoded vs skipped by the speech gate so far.
+void parakeet_stream_stats(const struct parakeet_stream* st, int* n_encoded, int* n_skipped);
 
 // Hyper-parameters needed by callers (frame duration for stamping etc.)
 int parakeet_frame_dur_cs(struct parakeet_context* ctx); // centiseconds per encoder frame
