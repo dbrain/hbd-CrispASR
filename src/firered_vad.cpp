@@ -73,13 +73,22 @@ static void read_f32(ggml_tensor* t, std::vector<float>& out) {
 }
 
 // Linear: out[i] = sum_j w[i*K+j] * x[j] + b[i], for each time step
+// Eight independent float accumulators so the compiler vectorises the dot product without
+// -ffast-math (a single double accumulator was ~40 ms per second of audio, scalar).
 static void cpu_linear(const float* x, const float* w, const float* b, float* out, int T, int K, int N) {
+    const int K8 = K & ~7;
     for (int t = 0; t < T; t++) {
+        const float* xr = x + (size_t)t * K;
         for (int n = 0; n < N; n++) {
-            double s = 0;
-            for (int k = 0; k < K; k++)
-                s += x[t * K + k] * w[n * K + k];
-            out[t * N + n] = (float)s + (b ? b[n] : 0.0f);
+            const float* wr = w + (size_t)n * K;
+            float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+            for (int k = 0; k < K8; k += 8)
+                for (int j = 0; j < 8; j++)
+                    acc[j] += xr[k + j] * wr[k + j];
+            float s = ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
+            for (int k = K8; k < K; k++)
+                s += xr[k] * wr[k];
+            out[(size_t)t * N + n] = s + (b ? b[n] : 0.0f);
         }
     }
 }
