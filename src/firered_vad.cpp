@@ -427,7 +427,9 @@ extern "C" int firered_vad_detect(struct firered_vad_context* ctx, const float* 
     for (int t = 0; t < T; t++)
         probs[t] = 1.0f / (1.0f + expf(-probs[t]));
 
-    // Debug: show probability stats
+    // Debug: probability stats (FIRERED_VAD_DEBUG=1). Off by default: a gated live stream calls
+    // this once per chunk, which would otherwise flood the server log.
+    static const bool vad_debug = getenv("FIRERED_VAD_DEBUG") && *getenv("FIRERED_VAD_DEBUG") != '0';
     float max_p = 0, mean_p = 0;
     int speech_frames = 0;
     for (int t = 0; t < T; t++) {
@@ -438,10 +440,12 @@ extern "C" int firered_vad_detect(struct firered_vad_context* ctx, const float* 
             speech_frames++;
     }
     mean_p /= T;
-    fprintf(stderr, "firered_vad: %d frames, max_prob=%.4f, mean_prob=%.4f, speech(>0.3)=%d\n", T, max_p, mean_p,
-            speech_frames);
-    fprintf(stderr, "  fbank[0,:3]=[%.2f,%.2f,%.2f] prob[0:5]=[%.4f,%.4f,%.4f,%.4f,%.4f]\n", features[0], features[1],
-            features[2], probs[0], probs[1], probs[2], probs[3], probs[4]);
+    if (vad_debug) {
+        fprintf(stderr, "firered_vad: %d frames, max_prob=%.4f, mean_prob=%.4f, speech(>0.3)=%d\n", T, max_p, mean_p,
+                speech_frames);
+        fprintf(stderr, "  fbank[0,:3]=[%.2f,%.2f,%.2f] prob[0:5]=[%.4f,%.4f,%.4f,%.4f,%.4f]\n", features[0],
+                features[1], features[2], probs[0], probs[1], probs[2], probs[3], probs[4]);
+    }
 
     // Convert frame probabilities to segments
     float frame_sec = 0.01f; // 10ms per frame
