@@ -3332,6 +3332,10 @@ struct parakeet_stream {
     int n_encoded = 0, n_skipped = 0;
     std::vector<parakeet_emitted_token> open_word; // tokens of the trailing, possibly unfinished word
     int n_word_starts = 0; // space-prefixed tokens so far: decides word grouping style like whole-file
+    // Blank frames after the last token that close the open word. Tokens inside one word can sit
+    // ~0.6 s apart ("truck" ... "s"), so this must stay above that.
+    int64_t word_gap_f = 0;
+    int64_t last_tok_f = 0; // absolute end frame of the newest token
     std::vector<float> enc;            // last window's encoder output (for the provisional decode)
     int64_t enc_ws = 0;
     int enc_T = 0;
@@ -3352,6 +3356,7 @@ extern "C" struct parakeet_stream* parakeet_stream_begin(struct parakeet_context
     st->chunk_f = std::max<int64_t>(1, (int64_t)std::lround(p.chunk_sec / fs));
     st->right_f = std::max<int64_t>(0, (int64_t)std::lround(p.right_sec / fs));
     st->left_f = std::max<int64_t>(0, (int64_t)std::lround(p.left_sec / fs));
+    st->word_gap_f = std::max<int64_t>(1, (int64_t)std::lround(0.8 / fs));
     st->speech_fn = p.speech_fn;
     st->speech_user = p.speech_user;
     st->hangover = std::max(0, p.hangover_chunks);
@@ -3413,6 +3418,11 @@ extern "C" struct parakeet_result* parakeet_stream_feed(struct parakeet_context*
     const int d_model = (int)ctx->model.hparams.d_model;
     const int64_t F = st->F;
     std::vector<parakeet_emitted_token> out;
+    // Tokens out[0, closed_n) are followed by a pause (word_gap_f decoded frames with no token, or
+    // a chunk skipped by the speech gate), so no later token can continue their word: it is
+    // released now instead of waiting for the next utterance.
+    size_t closed_n = 0;
+    bool closed = false;
 
     if (!st->started) {
         if (!tdt_gpu_start(ctx, nullptr)) {
@@ -3440,6 +3450,8 @@ extern "C" struct parakeet_result* parakeet_stream_feed(struct parakeet_context*
                 st->done_f += st->chunk_f;
                 st->t_next = std::max(st->t_next, st->done_f);
                 st->n_skipped++;
+                closed_n = out.size();
+                closed = true;
                 st->enc.clear(); // its lookahead was just judged silent; no stale provisional text
                 continue;
             }
@@ -3453,8 +3465,8 @@ extern "C" struct parakeet_result* parakeet_stream_feed(struct parakeet_context*
             return nullptr;
         const int local_stop = last ? T : (int)std::min<int64_t>(T, st->done_f + st->chunk_f - ws);
         const int local_t = (int)(st->t_next - ws);
+        const size_t n0 = out.size();
         if (local_t < local_stop) {
-            const size_t n0 = out.size();
             const int tn = tdt_gpu_decode_range(ctx, enc.data(), T, d_model, local_t, local_stop, out, nullptr);
             if (tn < 0)
                 return nullptr;
@@ -3463,6 +3475,12 @@ extern "C" struct parakeet_result* parakeet_stream_feed(struct parakeet_context*
                 out[i].t_end += (int)ws;
             }
             st->t_next = ws + tn;
+        }
+        if (out.size() > n0)
+            st->last_tok_f = out.back().t_end;
+        if (!last && st->t_next - st->last_tok_f >= st->word_gap_f) {
+            closed_n = out.size();
+            closed = true;
         }
         st->enc = std::move(enc);
         st->enc_ws = ws;
@@ -3523,6 +3541,7 @@ extern "C" struct parakeet_result* parakeet_stream_feed(struct parakeet_context*
             if (v.size() > 1 && v[0] == ' ')
                 st->n_word_starts++;
         }
+    const size_t n_open = st->open_word.size();
     std::vector<parakeet_emitted_token> wt = std::move(st->open_word);
     wt.insert(wt.end(), out.begin(), out.end());
     st->open_word.clear();
@@ -3536,6 +3555,8 @@ extern "C" struct parakeet_result* parakeet_stream_feed(struct parakeet_context*
             if (starts_word)
                 break;
         }
+        if (closed)
+            k = std::max(k, n_open + closed_n);
         st->open_word.assign(wt.begin() + (long)k, wt.end());
         wt.resize(k);
     }

@@ -117,8 +117,9 @@ struct parakeet_stream_params parakeet_stream_default_params(void);
 struct parakeet_stream* parakeet_stream_begin(struct parakeet_context* ctx, struct parakeet_stream_params params);
 // Append 16 kHz mono PCM. Returns the text/tokens committed by this call (possibly none; times
 // are absolute from the stream start, text keeps its leading space so deltas concatenate). Words
-// lag by up to one word: the trailing word is reported once the next word starts, or on the
-// flush, so a word cut by a chunk edge arrives whole. final=1 flushes the tail.
+// lag by up to one word: the trailing word is reported once the next word starts, after a pause
+// (0.8 s decoded with no token, or a gate-skipped chunk), or on the flush, so a word cut by a chunk
+// edge arrives whole. final=1 flushes the tail.
 // partial_mode 1: *out_partial receives a malloc'd provisional transcript of the audio not yet
 // committed, from the last window's lookahead (free). partial_mode 2: same, but re-encodes a
 // window ending at the newest sample first (one extra encoder pass) so the text reaches "now";
