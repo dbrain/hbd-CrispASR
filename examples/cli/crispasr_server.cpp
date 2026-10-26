@@ -33,6 +33,7 @@
 #include "../server/httplib.h"
 #include "../json.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -263,6 +264,197 @@ static bool check_cancel(const std::string& cancel_url) {
     }
 }
 
+// Centre of the quietest 20 ms in pcm[lo, hi), as a sample index. Window edges go here: see fill_word_gaps.
+static int quietest_point(const float* pcm, int n_samples, int lo, int hi) {
+    const int frame = 320;
+    lo = std::max(0, lo);
+    hi = std::min(n_samples, hi);
+    int best = std::clamp((lo + hi) / 2, 0, n_samples);
+    double best_e = -1.0;
+    for (int x = lo; x + frame <= hi; x += frame / 2) {
+        double e = 0.0;
+        for (int i = x; i < x + frame; i++)
+            e += (double)pcm[i] * pcm[i];
+        if (best_e < 0.0 || e < best_e) {
+            best_e = e;
+            best = x + frame / 2;
+        }
+    }
+    return best;
+}
+
+// Parakeet's encoder sometimes decides, deterministically for a given input window, that the rest of
+// the window is silence: the joint then prefers blank by 3-18 logits on every frame and whole sentences
+// of clear speech vanish until the window ends. The official ONNX weights through an independent decoder
+// do the same, so it is the model, not the port. What triggers it is a window that starts mid-speech:
+// over 30 s windows on four audiobooks, 16 of 390 starting at random points stalled, 0 of 300 whose
+// start and end sat on the quietest 20 ms nearby (~19.7k words, none lost). So every window edge is put
+// in a pause: the chunker cuts at the quietest point of the last 4 s, and this pass - a safety net for
+// what still slips through - re-decodes each word gap of PARAKEET_GAP_RETRY_SEC (default 3, 0 disables)
+// with up to three pause-snapped windows, keeps only the words that land inside the gap and recurses on
+// what is still empty. Windows never exceed chunk_seconds, so peak VRAM is unchanged.
+struct gap_fill_stats {
+    int gaps = 0, retries = 0, words = 0;
+    double audio_s = 0.0, elapsed_s = 0.0;
+    bool cancelled = false, worker_died = false;
+};
+
+template <typename RunOne, typename Cancelled>
+static gap_fill_stats fill_word_gaps(std::vector<crispasr_segment>& segs, const float* pcm, int n_samples,
+                                     int chunk_samples, RunOne&& run_one, Cancelled&& cancelled) {
+    gap_fill_stats st;
+    double min_gap_s = 3.0;
+    if (const char* e = std::getenv("PARAKEET_GAP_RETRY_SEC"))
+        min_gap_s = std::atof(e);
+    if (min_gap_s <= 0.0)
+        return st;
+
+    const int SR = 16000;
+    const int64_t min_gap = (int64_t)(min_gap_s * 100.0);
+    const int64_t end_cs = (int64_t)n_samples * 100 / SR;
+    const int64_t chunk_cs = (int64_t)chunk_samples * 100 / SR;
+    // Each variant snaps the window start into a different stretch around the gap start a (in cs, relative
+    // to a) and the end into the pause just past the gap end b. The last starts inside the gap: it is the
+    // only one that differs when the gap is a whole short upload.
+    static const int64_t start_lo[] = {-50, -500, 100}, start_hi[] = {30, -150, 300};
+    static const int64_t end_lo = 0, end_hi = 150;
+    const int n_variants = 3;
+    const int64_t max_lead = 500, max_trail = end_hi;
+
+    std::vector<crispasr_word> words;
+    std::vector<crispasr_token> tokens;
+    for (const auto& sg : segs) {
+        words.insert(words.end(), sg.words.begin(), sg.words.end());
+        tokens.insert(tokens.end(), sg.tokens.begin(), sg.tokens.end());
+    }
+    // A backend without word timings can't place a fill.
+    if (words.empty() && !segs.empty() && !segs.front().text.empty())
+        return st;
+
+    struct gap {
+        int64_t a, b;
+        int variant;
+    };
+    std::vector<gap> todo;
+    auto push_gaps = [&](const std::vector<crispasr_word>& ws, int64_t a, int64_t b, int variant) {
+        if (variant >= n_variants)
+            return;
+        int64_t prev = a;
+        auto push = [&](int64_t ga, int64_t gb) {
+            if (gb - ga < min_gap)
+                return;
+            // Split so a window plus its widest context still fits one chunk.
+            const int64_t span = std::max<int64_t>(min_gap, chunk_cs - max_lead - max_trail);
+            for (int64_t x = ga; x < gb; x += span)
+                todo.push_back({x, std::min(gb, x + span), variant});
+        };
+        for (const auto& w : ws) {
+            push(prev, w.t0);
+            prev = std::max(prev, w.t1);
+        }
+        push(prev, b);
+    };
+    push_gaps(words, 0, end_cs, 0);
+    st.gaps = (int)todo.size();
+
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<crispasr_word> new_words;
+    std::vector<crispasr_token> new_tokens;
+    // Bounds the work on music or silence; an all-empty window gets one full pass at the first variant.
+    const int64_t max_retry_cs = std::max<int64_t>(6000, end_cs);
+    int64_t retried_cs = 0;
+    while (!todo.empty()) {
+        const gap g = todo.back();
+        todo.pop_back();
+        if (retried_cs >= max_retry_cs)
+            break;
+        if (cancelled()) {
+            st.cancelled = true;
+            break;
+        }
+        auto window = [&](int v) {
+            const int64_t a0 = std::max<int64_t>(0, g.a + start_lo[v]), a1 = std::max<int64_t>(0, g.a + start_hi[v]);
+            const int s0 = a1 > a0 ? quietest_point(pcm, n_samples, (int)(a0 * SR / 100), (int)(a1 * SR / 100))
+                                   : (int)(a0 * SR / 100);
+            const int s1 = quietest_point(pcm, n_samples, (int)((g.b + end_lo) * SR / 100),
+                                          (int)((g.b + end_hi) * SR / 100));
+            return std::make_pair(s0, std::max(s1, std::min(n_samples, (int)(g.b * SR / 100))));
+        };
+        const auto [s0, s1] = window(g.variant);
+        bool repeat = false;
+        for (int v = 0; v < g.variant; v++)
+            repeat = repeat || window(v) == std::make_pair(s0, s1);
+        if (repeat || (int64_t)s0 * 100 / SR >= g.b || s1 - s0 < SR / 2) {
+            if (g.variant + 1 < n_variants)
+                todo.push_back({g.a, g.b, g.variant + 1});
+            continue;
+        }
+        const int64_t wa = (int64_t)s0 * 100 / SR, wb = (int64_t)s1 * 100 / SR;
+        bool died = false;
+        auto got = run_one(pcm + s0, s1 - s0, wa, &died);
+        st.retries++;
+        retried_cs += wb - wa;
+        if (died) {
+            st.worker_died = true;
+            break;
+        }
+        // A word belongs to the gap if its midpoint does; context words are already in the transcript.
+        auto inside = [&](int64_t x0, int64_t x1) {
+            const int64_t mid = (x0 + x1) / 2;
+            return mid > g.a && mid < g.b;
+        };
+        std::vector<crispasr_word> kept;
+        for (const auto& sg : got) {
+            for (const auto& w : sg.words)
+                if (inside(w.t0, w.t1))
+                    kept.push_back(w);
+            for (const auto& tk : sg.tokens)
+                if (tk.t0 >= 0 && inside(tk.t0, tk.t1))
+                    new_tokens.push_back(tk);
+        }
+        st.words += (int)kept.size();
+        new_words.insert(new_words.end(), kept.begin(), kept.end());
+        // A pause-snapped window that hears nothing means the gap is music or silence. Only a gap at the
+        // start of the audio, whose window can't start in a pause, earns the other variants.
+        if (!kept.empty() || g.a == 0)
+            push_gaps(kept, g.a, g.b, g.variant + 1);
+    }
+    st.audio_s = retried_cs / 100.0;
+    st.elapsed_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (new_words.empty())
+        return st;
+
+    // Re-cut into one segment per chunk, in time order, as the main pass produces them.
+    words.insert(words.end(), new_words.begin(), new_words.end());
+    tokens.insert(tokens.end(), new_tokens.begin(), new_tokens.end());
+    auto by_t0 = [](const auto& x, const auto& y) { return x.t0 < y.t0; };
+    std::stable_sort(words.begin(), words.end(), by_t0);
+    std::stable_sort(tokens.begin(), tokens.end(), by_t0);
+    std::vector<crispasr_segment> out;
+    const std::string speaker = segs.empty() ? std::string() : segs.front().speaker;
+    size_t wi = 0, ti = 0;
+    for (int64_t c0 = 0; c0 < end_cs || wi < words.size(); c0 += chunk_cs) {
+        const int64_t c1 = c0 + chunk_cs;
+        crispasr_segment sg;
+        sg.speaker = speaker;
+        for (; wi < words.size() && (words[wi].t0 < c1 || c1 >= end_cs); wi++) {
+            if (!sg.text.empty())
+                sg.text += ' ';
+            sg.text += words[wi].text;
+            sg.words.push_back(words[wi]);
+        }
+        for (; ti < tokens.size() && (tokens[ti].t0 < c1 || c1 >= end_cs); ti++)
+            sg.tokens.push_back(tokens[ti]);
+        if (sg.words.empty())
+            continue;
+        sg.t0 = sg.words.front().t0;
+        sg.t1 = sg.words.back().t1;
+        out.push_back(std::move(sg));
+    }
+    segs = std::move(out);
+    return st;
+}
+
 // Decode audio from a path on disk and transcribe it. Caller is responsible
 // for placing audio at `audio_path` (either a real file_path or a temp file
 // written from a multipart upload). Acquires model_mutex itself (per chunk in worker mode).
@@ -352,17 +544,22 @@ static transcription_result do_transcribe(const std::string& audio_path, Crispas
             // control long enough to poll cancel_url; if koblem signals
             // preemption we keep the partial transcript and bail.
             int n_chunks = (n_samples + max_chunk_samples - 1) / max_chunk_samples;
-            fprintf(stderr, "crispasr-server: chunking %.1fs audio into %d × %ds segments\n", result.duration_s,
+            fprintf(stderr, "crispasr-server: chunking %.1fs audio into ~%d × <=%ds segments\n", result.duration_s,
                     n_chunks, rp.chunk_seconds);
             int chunk_idx = 0;
-            for (int offset = 0; offset < n_samples; offset += max_chunk_samples) {
+            for (int offset = 0, chunk_len = 0; offset < n_samples; offset += chunk_len) {
                 if (check_cancel(cancel_url)) {
                     fprintf(stderr, "crispasr-server: cancel_url signalled preemption at chunk %d/%d\n", chunk_idx,
                             n_chunks);
                     result.preempted = true;
                     break;
                 }
-                int chunk_len = std::min(max_chunk_samples, n_samples - offset);
+                chunk_len = std::min(max_chunk_samples, n_samples - offset);
+                // Both ends of every chunk sit in a pause; see fill_word_gaps for why.
+                if (offset + chunk_len < n_samples)
+                    chunk_len = quietest_point(pcmf32.data(), n_samples, offset + chunk_len - 4 * SR,
+                                               offset + chunk_len) -
+                                offset;
                 int64_t t_offset_cs = (int64_t)((double)offset / SR * 100.0);
                 auto tc0 = std::chrono::steady_clock::now();
                 auto chunk_segs = run_one(pcmf32.data() + offset, chunk_len, t_offset_cs, &worker_died);
@@ -379,6 +576,22 @@ static transcription_result do_transcribe(const std::string& audio_path, Crispas
                     return result;
                 }
             }
+        }
+
+        if (!result.preempted) {
+            auto gs = fill_word_gaps(result.segs, pcmf32.data(), n_samples, max_chunk_samples, run_one,
+                                     [&] { return check_cancel(cancel_url); });
+            if (gs.gaps)
+                fprintf(stderr,
+                        "crispasr-server: gap fill: %d gaps >= threshold, %d retries over %.1fs audio, +%d words "
+                        "in %.2fs\n",
+                        gs.gaps, gs.retries, gs.audio_s, gs.words, gs.elapsed_s);
+            if (gs.worker_died) {
+                result.error = "worker died during gap fill: " + worker->last_error();
+                result.elapsed_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                return result;
+            }
+            result.preempted = gs.cancelled;
         }
 
         auto t1 = std::chrono::steady_clock::now();
