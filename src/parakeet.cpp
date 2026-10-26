@@ -3336,13 +3336,20 @@ struct parakeet_stream {
     // ~0.6 s apart ("truck" ... "s"), so this must stay above that.
     int64_t word_gap_f = 0;
     int64_t last_tok_f = 0; // absolute end frame of the newest token
+    bool reset_since_tok = false;
     std::vector<float> enc;            // last window's encoder output (for the provisional decode)
     int64_t enc_ws = 0;
     int enc_T = 0;
 };
 
+// Lookahead floor. The decoded chunk sits at the tail of its window, where the model's "rest is
+// silence" verdicts land: with pause-snapped window starts and the predictor reset, replaying two
+// audiobooks lost 8.1%/2.5% of the words at 0.64 s and 2.1%/0% at 0.96 s. Missing words cost more
+// than ~0.3 s of extra latency, so requests for less are raised to this.
+static const float stream_min_right_sec = 0.96f;
+
 extern "C" struct parakeet_stream_params parakeet_stream_default_params(void) {
-    return {0.64f, 0.64f, 10.0f, nullptr, nullptr, 2};
+    return {0.64f, stream_min_right_sec, 10.0f, nullptr, nullptr, 2};
 }
 
 extern "C" struct parakeet_stream* parakeet_stream_begin(struct parakeet_context* ctx,
@@ -3354,7 +3361,7 @@ extern "C" struct parakeet_stream* parakeet_stream_begin(struct parakeet_context
     st->F = (int)hp.hop_length * (int)hp.subsampling_factor;
     const double fs = (double)st->F / 16000.0;
     st->chunk_f = std::max<int64_t>(1, (int64_t)std::lround(p.chunk_sec / fs));
-    st->right_f = std::max<int64_t>(0, (int64_t)std::lround(p.right_sec / fs));
+    st->right_f = (int64_t)std::lround(std::max(p.right_sec, stream_min_right_sec) / fs);
     st->left_f = std::max<int64_t>(0, (int64_t)std::lround(p.left_sec / fs));
     st->word_gap_f = std::max<int64_t>(1, (int64_t)std::lround(0.8 / fs));
     st->speech_fn = p.speech_fn;
@@ -3400,6 +3407,36 @@ static std::vector<float> stream_encode(parakeet_context* ctx, const float* samp
     const auto& hp = ctx->model.hparams;
     const int T_valid_enc = n_samples / (int)hp.hop_length / (int)hp.subsampling_factor;
     return parakeet_encode_mel(ctx, mel.data(), (int)hp.n_mels, T_mel, T_enc, T_valid_enc);
+}
+
+// Encoder windows that start mid-speech can make the model call the rest of the window silence, and the
+// stream decodes exactly that tail: replaying audiobooks through 10 s windows lost up to 51% of the words
+// (12% once starts were snapped). Start each window on the quietest frame boundary within stream_snap_f
+// of the nominal left edge instead.
+static const int64_t stream_snap_f = 25; // 2 s
+
+static int64_t stream_window_start(const parakeet_stream* st) {
+    // Before left_f of history exists the nominal start is the stream's first sample, which may be
+    // mid-word; once the decoder is past a pause near it, start there instead.
+    const int64_t nominal = std::max<int64_t>(0, st->done_f - st->left_f);
+    const int64_t F = st->F, half = 160;
+    const int64_t lo = std::max(nominal - stream_snap_f, (st->buf_start + half + F - 1) / F);
+    const int64_t hi = std::min(nominal + stream_snap_f, st->done_f - 1);
+    int64_t best = std::max<int64_t>(0, std::min(nominal, hi));
+    double best_e = -1.0;
+    for (int64_t f = lo; f <= hi; f++) {
+        const int64_t a = f * F - half - st->buf_start, b = f * F + half - st->buf_start;
+        if (a < 0 || b > (int64_t)st->buf.size())
+            continue;
+        double e = 0.0;
+        for (int64_t i = a; i < b; i++)
+            e += (double)st->buf[i] * st->buf[i];
+        if (best_e < 0.0 || e < best_e) {
+            best_e = e;
+            best = f;
+        }
+    }
+    return best;
 }
 
 extern "C" struct parakeet_result* parakeet_stream_feed(struct parakeet_context* ctx, struct parakeet_stream* st,
@@ -3457,7 +3494,7 @@ extern "C" struct parakeet_result* parakeet_stream_feed(struct parakeet_context*
             }
         }
         st->n_encoded++;
-        const int64_t ws = std::max<int64_t>(0, st->done_f - st->left_f);
+        const int64_t ws = stream_window_start(st);
         const int64_t we = last ? st->n_total : need_f * F;
         int T = 0;
         std::vector<float> enc = stream_encode(ctx, st->buf.data() + (ws * F - st->buf_start), (int)(we - ws * F), &T);
@@ -3476,11 +3513,22 @@ extern "C" struct parakeet_result* parakeet_stream_feed(struct parakeet_context*
             }
             st->t_next = ws + tn;
         }
-        if (out.size() > n0)
+        if (out.size() > n0) {
             st->last_tok_f = out.back().t_end;
+            st->reset_since_tok = false;
+        }
         if (!last && st->t_next - st->last_tok_f >= st->word_gap_f) {
             closed_n = out.size();
             closed = true;
+            // The predictor state carried across steps can settle where blank wins on every frame, and
+            // since it only moves on a token it then stays stuck: replaying LOTR lost 19 s of speech that
+            // fresh windows over the same audio all decoded. A pause ends the word anyway, so start the
+            // predictor afresh there.
+            if (!st->reset_since_tok) {
+                if (!tdt_gpu_start(ctx, nullptr))
+                    return nullptr;
+                st->reset_since_tok = true;
+            }
         }
         st->enc = std::move(enc);
         st->enc_ws = ws;
@@ -3494,7 +3542,7 @@ extern "C" struct parakeet_result* parakeet_stream_feed(struct parakeet_context*
     }
 
     // Drop audio no future window can reach.
-    const int64_t keep_from = std::max<int64_t>(0, st->done_f - st->left_f) * F;
+    const int64_t keep_from = std::max<int64_t>(0, st->done_f - st->left_f - stream_snap_f) * F;
     if (keep_from > st->buf_start) {
         const int64_t drop = std::min<int64_t>(keep_from - st->buf_start, (int64_t)st->buf.size());
         st->buf.erase(st->buf.begin(), st->buf.begin() + drop);
@@ -3505,7 +3553,7 @@ extern "C" struct parakeet_result* parakeet_stream_feed(struct parakeet_context*
     // cheap form reuses the last window's lookahead; the fresh form (partial_mode 2) first
     // re-encodes a window ending at the newest sample so the tail reaches "now".
     if (out_partial && partial_mode == 2 && !st->finished && st->n_total > st->t_next * F) {
-        const int64_t ws = std::max<int64_t>(0, st->done_f - st->left_f);
+        const int64_t ws = stream_window_start(st);
         int T = 0;
         std::vector<float> enc =
             stream_encode(ctx, st->buf.data() + (ws * F - st->buf_start), (int)(st->n_total - ws * F), &T);

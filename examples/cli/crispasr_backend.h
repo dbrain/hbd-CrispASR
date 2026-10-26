@@ -93,7 +93,7 @@ enum crispasr_capability : uint32_t {
 // lookahead, replaced wholesale by the next delta.
 struct crispasr_stream_opts {
     float chunk_sec = 0.64f;
-    float right_sec = 0.64f;
+    float right_sec = 0.96f; // parakeet raises anything lower to 0.96
     float left_sec = 10.0f;
     float vad_threshold = 0.0f; // > 0: skip chunks the backend's VAD finds no speech in
 };

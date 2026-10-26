@@ -93,9 +93,9 @@ void parakeet_set_temperature(struct parakeet_context* ctx, float temperature, u
 // Audio is cut on a fixed grid of chunk_sec. Each chunk is encoded inside a window of
 // [left_sec of history | chunk | right_sec of lookahead] with full attention, only the chunk's
 // frames are decoded, and the TDT predictor state carries across chunks, so text is final once
-// returned. Latency ~= chunk + right context + compute. Accuracy falls off sharply below ~0.64 s
-// of right context. The caller serialises calls per context; several streams may share one
-// context (each keeps its own predictor state).
+// returned. Latency ~= chunk + right context + compute. Right context is at least 0.96 s: below
+// that, words drop (see stream_min_right_sec). The caller serialises calls per context; several
+// streams may share one context (each keeps its own predictor state).
 // Optional speech gate: called before a chunk is encoded with the audio [chunk start - up to 1 s
 // of context, end of lookahead). Return 0 for "no speech" and the chunk is skipped (no encoder
 // pass; equivalent to decoding it as all-blank, so the predictor state is unaffected). Decoding
@@ -106,7 +106,7 @@ typedef int (*parakeet_speech_fn)(const float* samples, int n_samples, void* use
 
 struct parakeet_stream_params {
     float chunk_sec; // decode grid (default 0.64)
-    float right_sec; // lookahead the chunk sees (default 0.64)
+    float right_sec; // lookahead the chunk sees (default and minimum 0.96)
     float left_sec;  // history the chunk sees (default 10.0)
     parakeet_speech_fn speech_fn; // NULL = decode every chunk
     void* speech_user;
