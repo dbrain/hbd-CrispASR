@@ -59,7 +59,12 @@
 #include <io.h> // _mktemp_s
 #include <windows.h>
 #else
+#include <fcntl.h>
+#include <spawn.h>
+#include <sys/wait.h>
 #include <unistd.h> // mkstemp, close, unlink
+
+extern char** environ;
 #endif
 
 // ---------------------------------------------------------------------------
@@ -458,6 +463,176 @@ static gap_fill_stats fill_word_gaps(std::vector<crispasr_segment>& segs, const 
     return st;
 }
 
+// A file longer than this is decoded and transcribed one window at a time: a whole 37 h book held as
+// float PCM took 8.5 GB, and sample offsets are int, so past 37.2 h a single pass could not work at all.
+static constexpr int k_window_seconds = 4 * 3600;
+// Decoded past the window end so the chunk that crosses it still ends in a pause.
+static constexpr int k_window_margin_seconds = 120;
+
+#ifndef _WIN32
+// Runs argv without a shell (any path is safe) and returns its stdout; false if it can't start or exits
+// non-zero.
+static bool run_capture(const std::vector<std::string>& args, std::string& out) {
+    std::vector<char*> argv;
+    for (const auto& a : args)
+        argv.push_back(const_cast<char*>(a.c_str()));
+    argv.push_back(nullptr);
+    int fds[2];
+    if (pipe2(fds, O_CLOEXEC) != 0)
+        return false;
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, fds[1], STDOUT_FILENO);
+    pid_t pid;
+    const int rc = posix_spawnp(&pid, argv[0], &fa, nullptr, argv.data(), environ);
+    posix_spawn_file_actions_destroy(&fa);
+    close(fds[1]);
+    if (rc != 0) {
+        close(fds[0]);
+        return false;
+    }
+    out.clear();
+    char buf[1 << 16];
+    for (;;) {
+        const ssize_t n = read(fds[0], buf, sizeof buf);
+        if (n > 0)
+            out.append(buf, (size_t)n);
+        else if (n == 0 || errno != EINTR)
+            break;
+    }
+    close(fds[0]);
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+static double probe_duration_s(const std::string& path) {
+    std::string out;
+    if (!run_capture({"ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", path},
+                     out))
+        return -1.0;
+    return std::atof(out.c_str());
+}
+
+// Decodes [start_s, start_s + len_s) of the first audio stream to 16 kHz mono.
+static bool decode_window(const std::string& path, double start_s, double len_s, std::vector<float>& pcm) {
+    char ss[32], t[32];
+    snprintf(ss, sizeof ss, "%.6f", start_s);
+    snprintf(t, sizeof t, "%.6f", len_s);
+    std::string out;
+    if (!run_capture({"ffmpeg", "-nostdin", "-loglevel", "error", "-ss", ss, "-i", path, "-t", t, "-map", "0:a:0", "-f",
+                      "s16le", "-ac", "1", "-ar", "16000", "-"},
+                     out))
+        return false;
+    const size_t n = out.size() / sizeof(int16_t);
+    pcm.resize(n);
+    const int16_t* s16 = reinterpret_cast<const int16_t*>(out.data());
+    for (size_t i = 0; i < n; i++)
+        pcm[i] = (float)s16[i] / 32768.0f;
+    return true;
+}
+#endif
+
+struct pcm_pass {
+    std::vector<crispasr_segment> segs; // centiseconds from pcm[0]
+    int consumed = 0;                   // samples transcribed; a pause cut unless it is the whole buffer
+    bool preempted = false;
+    std::string error;
+};
+
+// Transcribes pcm[0, n) in chunks cut at pauses, stopping at the first cut at or past stop_at, then
+// re-decodes the word gaps up to that cut.
+template <typename RunOne>
+static pcm_pass transcribe_pcm(const float* pcm, int n_samples, int stop_at, int max_chunk_samples, int chunk_seconds,
+                               const std::string& cancel_url, crispasr::WorkerSession* worker, RunOne&& run_one) {
+    const int SR = 16000;
+    pcm_pass out;
+    bool worker_died = false;
+    if (n_samples <= max_chunk_samples) {
+        // Short audio — single pass; no cancel checkpoint mid-chunk
+        // (the encoder owns the GPU for the duration of one transcribe
+        // call and there's no cooperative preemption inside it).
+        out.segs = run_one(pcm, n_samples, 0, &worker_died);
+        out.consumed = n_samples;
+        if (worker_died) {
+            out.error = "worker died mid-transcribe: " + worker->last_error();
+            return out;
+        }
+    } else {
+        // Chunk long audio into fixed segments. Between chunks we yield
+        // control long enough to poll cancel_url; if koblem signals
+        // preemption we keep the partial transcript and bail.
+        int n_chunks = (std::min(n_samples, stop_at + max_chunk_samples) + max_chunk_samples - 1) / max_chunk_samples;
+        fprintf(stderr, "crispasr-server: chunking %.1fs audio into ~%d × <=%ds segments\n",
+                (double)std::min(n_samples, stop_at) / SR, n_chunks, chunk_seconds);
+        int chunk_idx = 0;
+        int offset = 0;
+        for (int chunk_len = 0; offset < n_samples && offset < stop_at; offset += chunk_len) {
+            if (check_cancel(cancel_url)) {
+                fprintf(stderr, "crispasr-server: cancel_url signalled preemption at chunk %d/%d\n", chunk_idx,
+                        n_chunks);
+                out.preempted = true;
+                break;
+            }
+            chunk_len = std::min(max_chunk_samples, n_samples - offset);
+            // Both ends of every chunk sit in a pause; see fill_word_gaps for why.
+            if (offset + chunk_len < n_samples)
+                chunk_len = quietest_point(pcm, n_samples, offset + chunk_len - 4 * SR, offset + chunk_len) - offset;
+            int64_t t_offset_cs = (int64_t)((double)offset / SR * 100.0);
+            auto tc0 = std::chrono::steady_clock::now();
+            auto chunk_segs = run_one(pcm + offset, chunk_len, t_offset_cs, &worker_died);
+            auto tc1 = std::chrono::steady_clock::now();
+            double chunk_s = std::chrono::duration<double>(tc1 - tc0).count();
+            out.segs.insert(out.segs.end(), chunk_segs.begin(), chunk_segs.end());
+            chunk_idx++;
+            fprintf(stderr, "crispasr-server: chunk %d/%d done (%.1fs audio in %.1fs)%s\n", chunk_idx, n_chunks,
+                    chunk_len / (double)SR, chunk_s, worker_died ? " [WORKER DIED]" : "");
+            if (worker_died) {
+                out.error = "worker died at chunk " + std::to_string(chunk_idx) + "/" + std::to_string(n_chunks) +
+                            ": " + worker->last_error();
+                return out;
+            }
+        }
+        out.consumed = offset;
+    }
+
+    if (!out.preempted) {
+        auto gs = fill_word_gaps(out.segs, pcm, out.consumed, max_chunk_samples, run_one,
+                                 [&] { return check_cancel(cancel_url); });
+        if (gs.gaps)
+            fprintf(stderr,
+                    "crispasr-server: gap fill: %d gaps >= threshold, %d retries over %.1fs audio, +%d words "
+                    "in %.2fs\n",
+                    gs.gaps, gs.retries, gs.audio_s, gs.words, gs.elapsed_s);
+        if (gs.worker_died) {
+            out.error = "worker died during gap fill: " + worker->last_error();
+            return out;
+        }
+        out.preempted = gs.cancelled;
+    }
+    return out;
+}
+
+static void shift_segments(std::vector<crispasr_segment>& segs, int64_t cs) {
+    for (auto& sg : segs) {
+        sg.t0 += cs;
+        sg.t1 += cs;
+        for (auto& w : sg.words) {
+            w.t0 += cs;
+            w.t1 += cs;
+        }
+        for (auto& tk : sg.tokens) {
+            if (tk.t0 >= 0)
+                tk.t0 += cs;
+            if (tk.t1 >= 0)
+                tk.t1 += cs;
+            if (tk.t_dtw >= 0)
+                tk.t_dtw += cs;
+        }
+    }
+}
+
 // Decode audio from a path on disk and transcribe it. Caller is responsible
 // for placing audio at `audio_path` (either a real file_path or a temp file
 // written from a multipart upload). Acquires model_mutex itself (per chunk in worker mode).
@@ -481,6 +656,79 @@ static transcription_result do_transcribe(const std::string& audio_path, Crispas
     if (rp.verbose)
         fprintf(stderr, "crispasr-server: processing '%s'\n", audio_path.c_str());
 
+    // Auto-chunk long audio to prevent OOM (#27).
+    // Most backends have O(T²) attention in the encoder — 30s chunks keep
+    // memory bounded. The CLI does this via --vad / --chunk-seconds.
+    const int SR = 16000;
+    const int max_chunk_samples = rp.chunk_seconds * SR; // default 30s = 480000
+
+    // run_one returns segments + a worker-died flag. In worker mode, after
+    // each call we sample worker->is_alive() to distinguish "real empty
+    // result" (silent chunk) from "worker died and the call returned {}".
+    // Without this distinction the chunked path used to silently swallow
+    // worker death and return a partial transcript flagged ok=true.
+    //
+    // Worker mode takes model_mutex per chunk, not per file, so live /v1/stream feeds interleave
+    // with a long file job and wait at most one chunk. In-process mode holds it for the whole file:
+    // /unload frees `backend` outright, and this raw pointer must not outlive it mid-file.
+    // file_jobs (shared here, exclusive in /unload, /load and the idle watchdog) keeps the old
+    // guarantee that an unload waits for a running file job instead of landing between chunks.
+    auto run_one = [&](const float* p, int n, int64_t t_off_cs, bool* worker_died) {
+        std::unique_lock<std::mutex> chunk_lock(model_mutex, std::defer_lock);
+        if (worker)
+            chunk_lock.lock();
+        std::vector<crispasr_segment> segs =
+            worker ? worker->transcribe(p, n, t_off_cs, rp) : backend->transcribe(p, n, t_off_cs, rp);
+        *worker_died = worker && !worker->is_alive();
+        return segs;
+    };
+    auto finish = [&](const pcm_pass& pass, std::chrono::steady_clock::time_point t0) {
+        result.error = pass.error;
+        result.preempted = pass.preempted;
+        result.elapsed_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        result.ok = pass.error.empty();
+    };
+
+#ifndef _WIN32
+    const double probed_s = rp.diarize ? -1.0 : probe_duration_s(audio_path);
+    if (probed_s > k_window_seconds + k_window_margin_seconds) {
+        fprintf(stderr, "crispasr-server: %.1fs audio, transcribing in %d s windows\n", probed_s, k_window_seconds);
+        result.duration_s = probed_s;
+        std::shared_lock<std::shared_mutex> job_lock(file_jobs);
+        std::unique_lock<std::mutex> file_lock(model_mutex, std::defer_lock);
+        if (!worker)
+            file_lock.lock();
+        const auto t0 = std::chrono::steady_clock::now();
+        const int window = k_window_seconds * SR, span = (k_window_seconds + k_window_margin_seconds) * SR;
+        pcm_pass all;
+        // Each window starts exactly where the last one's final chunk ended, so every seam is a pause cut.
+        for (int64_t start = 0;;) {
+            std::vector<float> pcm;
+            if (!decode_window(audio_path, (double)start / SR, (double)span / SR, pcm)) {
+                all.error = "failed to decode audio at " + std::to_string(start / SR) + " s";
+                finish(all, t0);
+                return result;
+            }
+            if (pcm.empty())
+                break;
+            const int n = (int)pcm.size();
+            const bool last = n < span - SR;
+            pcm_pass pass = transcribe_pcm(pcm.data(), n, last ? n : window, max_chunk_samples, rp.chunk_seconds,
+                                           cancel_url, worker, run_one);
+            shift_segments(pass.segs, start * 100 / SR);
+            all.segs.insert(all.segs.end(), pass.segs.begin(), pass.segs.end());
+            all.error = pass.error;
+            all.preempted = pass.preempted;
+            if (last || pass.preempted || !pass.error.empty() || pass.consumed <= 0)
+                break;
+            start += pass.consumed;
+        }
+        result.segs = std::move(all.segs);
+        finish(all, t0);
+        return result;
+    }
+#endif
+
     // Decode audio directly from the provided path.
     std::vector<float> pcmf32;
     std::vector<std::vector<float>> pcmf32s;
@@ -496,119 +744,25 @@ static transcription_result do_transcribe(const std::string& audio_path, Crispas
 
     result.duration_s = (double)pcmf32.size() / 16000.0;
 
-    // Sample offsets below are int; refuse rather than wrap (2^31 samples is 37.2 h).
-    if (pcmf32.size() > (size_t)std::numeric_limits<int>::max() - (size_t)rp.chunk_seconds * 16000) {
+    // Sample offsets are int; refuse rather than wrap (2^31 samples is 37.2 h). Only reachable when the
+    // windowed path above can't run (no ffprobe, or diarization).
+    if (pcmf32.size() > (size_t)std::numeric_limits<int>::max() - (size_t)max_chunk_samples) {
         result.error = "audio too long: " + std::to_string((int)(result.duration_s / 3600.0)) +
-                       " h exceeds the 37 h per-request limit";
+                       " h exceeds the 37 h single-pass limit";
         return result;
     }
 
-    // Auto-chunk long audio to prevent OOM (#27).
-    // Most backends have O(T²) attention in the encoder — 30s chunks keep
-    // memory bounded. The CLI does this via --vad / --chunk-seconds.
-    const int SR = 16000;
-    const int max_chunk_samples = rp.chunk_seconds * SR; // default 30s = 480000
-    const int n_samples = (int)pcmf32.size();
-
-    // run_one returns segments + a worker-died flag. In worker mode, after
-    // each call we sample worker->is_alive() to distinguish "real empty
-    // result" (silent chunk) from "worker died and the call returned {}".
-    // Without this distinction the chunked path used to silently swallow
-    // worker death and return a partial transcript flagged ok=true.
-    //
-    // Worker mode takes model_mutex per chunk, not per file, so live /v1/stream feeds interleave
-    // with a long file job and wait at most one chunk. In-process mode holds it for the whole file:
-    // /unload frees `backend` outright, and this raw pointer must not outlive it mid-file.
-    // file_jobs (shared here, exclusive in /unload, /load and the idle watchdog) keeps the old
-    // guarantee that an unload waits for a running file job instead of landing between chunks.
     std::shared_lock<std::shared_mutex> job_lock(file_jobs);
     std::unique_lock<std::mutex> file_lock(model_mutex, std::defer_lock);
     if (!worker)
         file_lock.lock();
-    auto run_one = [&](const float* p, int n, int64_t t_off_cs, bool* worker_died) {
-        std::unique_lock<std::mutex> chunk_lock(model_mutex, std::defer_lock);
-        if (worker)
-            chunk_lock.lock();
-        std::vector<crispasr_segment> segs =
-            worker ? worker->transcribe(p, n, t_off_cs, rp) : backend->transcribe(p, n, t_off_cs, rp);
-        *worker_died = worker && !worker->is_alive();
-        return segs;
-    };
-
-    {
-        auto t0 = std::chrono::steady_clock::now();
-
-        bool worker_died = false;
-        if (n_samples <= max_chunk_samples) {
-            // Short audio — single pass; no cancel checkpoint mid-chunk
-            // (the encoder owns the GPU for the duration of one transcribe
-            // call and there's no cooperative preemption inside it).
-            result.segs = run_one(pcmf32.data(), n_samples, 0, &worker_died);
-            if (worker_died) {
-                result.error = "worker died mid-transcribe: " + worker->last_error();
-                result.elapsed_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-                return result;
-            }
-        } else {
-            // Chunk long audio into fixed segments. Between chunks we yield
-            // control long enough to poll cancel_url; if koblem signals
-            // preemption we keep the partial transcript and bail.
-            int n_chunks = (n_samples + max_chunk_samples - 1) / max_chunk_samples;
-            fprintf(stderr, "crispasr-server: chunking %.1fs audio into ~%d × <=%ds segments\n", result.duration_s,
-                    n_chunks, rp.chunk_seconds);
-            int chunk_idx = 0;
-            for (int offset = 0, chunk_len = 0; offset < n_samples; offset += chunk_len) {
-                if (check_cancel(cancel_url)) {
-                    fprintf(stderr, "crispasr-server: cancel_url signalled preemption at chunk %d/%d\n", chunk_idx,
-                            n_chunks);
-                    result.preempted = true;
-                    break;
-                }
-                chunk_len = std::min(max_chunk_samples, n_samples - offset);
-                // Both ends of every chunk sit in a pause; see fill_word_gaps for why.
-                if (offset + chunk_len < n_samples)
-                    chunk_len = quietest_point(pcmf32.data(), n_samples, offset + chunk_len - 4 * SR,
-                                               offset + chunk_len) -
-                                offset;
-                int64_t t_offset_cs = (int64_t)((double)offset / SR * 100.0);
-                auto tc0 = std::chrono::steady_clock::now();
-                auto chunk_segs = run_one(pcmf32.data() + offset, chunk_len, t_offset_cs, &worker_died);
-                auto tc1 = std::chrono::steady_clock::now();
-                double chunk_s = std::chrono::duration<double>(tc1 - tc0).count();
-                result.segs.insert(result.segs.end(), chunk_segs.begin(), chunk_segs.end());
-                chunk_idx++;
-                fprintf(stderr, "crispasr-server: chunk %d/%d done (%.1fs audio in %.1fs)%s\n", chunk_idx, n_chunks,
-                        chunk_len / (double)SR, chunk_s, worker_died ? " [WORKER DIED]" : "");
-                if (worker_died) {
-                    result.error = "worker died at chunk " + std::to_string(chunk_idx) + "/" +
-                                   std::to_string(n_chunks) + ": " + worker->last_error();
-                    result.elapsed_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-                    return result;
-                }
-            }
-        }
-
-        if (!result.preempted) {
-            auto gs = fill_word_gaps(result.segs, pcmf32.data(), n_samples, max_chunk_samples, run_one,
-                                     [&] { return check_cancel(cancel_url); });
-            if (gs.gaps)
-                fprintf(stderr,
-                        "crispasr-server: gap fill: %d gaps >= threshold, %d retries over %.1fs audio, +%d words "
-                        "in %.2fs\n",
-                        gs.gaps, gs.retries, gs.audio_s, gs.words, gs.elapsed_s);
-            if (gs.worker_died) {
-                result.error = "worker died during gap fill: " + worker->last_error();
-                result.elapsed_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-                return result;
-            }
-            result.preempted = gs.cancelled;
-        }
-
-        auto t1 = std::chrono::steady_clock::now();
-        result.elapsed_s = std::chrono::duration<double>(t1 - t0).count();
-    }
-
-    result.ok = true;
+    const auto t0 = std::chrono::steady_clock::now();
+    const int n_samples = (int)pcmf32.size();
+    pcm_pass pass =
+        transcribe_pcm(pcmf32.data(), n_samples, n_samples, max_chunk_samples, rp.chunk_seconds, cancel_url, worker,
+                       run_one);
+    result.segs = std::move(pass.segs);
+    finish(pass, t0);
     return result;
 }
 
