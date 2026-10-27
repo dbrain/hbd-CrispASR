@@ -45,6 +45,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -269,9 +270,11 @@ static int quietest_point(const float* pcm, int n_samples, int lo, int hi) {
     const int frame = 320;
     lo = std::max(0, lo);
     hi = std::min(n_samples, hi);
-    int best = std::clamp((lo + hi) / 2, 0, n_samples);
+    // Not (lo + hi) / 2: past 2^30 samples (18.6 h) the sum overflows, and GCC then drops the search and
+    // returns 0, so the chunk length comes out as minus the file offset and the worker dies.
+    int best = std::clamp(lo + (hi - lo) / 2, 0, n_samples);
     double best_e = -1.0;
-    for (int x = lo; x + frame <= hi; x += frame / 2) {
+    for (int x = lo; x <= hi - frame; x += frame / 2) {
         double e = 0.0;
         for (int i = x; i < x + frame; i++)
             e += (double)pcm[i] * pcm[i];
@@ -492,6 +495,13 @@ static transcription_result do_transcribe(const std::string& audio_path, Crispas
     }
 
     result.duration_s = (double)pcmf32.size() / 16000.0;
+
+    // Sample offsets below are int; refuse rather than wrap (2^31 samples is 37.2 h).
+    if (pcmf32.size() > (size_t)std::numeric_limits<int>::max() - (size_t)rp.chunk_seconds * 16000) {
+        result.error = "audio too long: " + std::to_string((int)(result.duration_s / 3600.0)) +
+                       " h exceeds the 37 h per-request limit";
+        return result;
+    }
 
     // Auto-chunk long audio to prevent OOM (#27).
     // Most backends have O(T²) attention in the encoder — 30s chunks keep

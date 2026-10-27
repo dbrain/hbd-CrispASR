@@ -383,6 +383,9 @@ int ffmpeg_decode_audio(const std::string &ifname, std::vector<uint8_t>& owav_da
     u8 *ibuf = NULL;
     size_t ibuf_size;
     int err = map_file(ifd, &ibuf, &ibuf_size);
+    // The mapping outlives the fd. Both used to leak per call: the server reached its 1024-fd limit
+    // after ~1000 files, and every worker it spawned then inherited them and could not open the GPU.
+    close(ifd);
     if (err) {
         LOG("Couldn't map input file %s\n", ifname.c_str());
         return err;
@@ -397,6 +400,7 @@ int ffmpeg_decode_audio(const std::string &ifname, std::vector<uint8_t>& owav_da
     int osize=0;
 
     err = decode_audio(&inaudio_buf, &odata, &osize);
+    munmap(ibuf, ibuf_size);
     LOG("decode_audio returned %d \n", err);
     if (err != 0) {
         LOG("decode_audio failed\n");
